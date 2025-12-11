@@ -91,21 +91,28 @@ class MainWindow(QMainWindow):
         self.event_organisateur.setPlaceholderText("Organisateur")
         form.addWidget(self.event_organisateur)
         
-        btn_template = QPushButton("📁 Template")
-        btn_template.clicked.connect(self.choisir_template)
-        form.addWidget(btn_template)
-        
-        btn_edit_template = QPushButton("🎨 Éditer Template")
-        btn_edit_template.clicked.connect(self.editer_template)
-        form.addWidget(btn_edit_template)
-        
-        self.template_path = None
+        self.event_id_en_cours = None  # Pour stocker l'ID lors de la modification
         
         btn_ajouter = QPushButton("➕ Ajouter")
         btn_ajouter.clicked.connect(self.ajouter_evenement)
         form.addWidget(btn_ajouter)
         
         layout.addLayout(form)
+        
+        # Boutons d'action
+        actions_layout = QHBoxLayout()
+        
+        btn_modifier = QPushButton("✏️ Modifier l'événement sélectionné")
+        btn_modifier.clicked.connect(self.preparer_modification_evenement)
+        btn_modifier.setStyleSheet(f"background-color: {COLOR_WARNING}; color: white; padding: 8px;")
+        actions_layout.addWidget(btn_modifier)
+        
+        btn_supprimer = QPushButton("🗑️ Supprimer l'événement sélectionné")
+        btn_supprimer.clicked.connect(self.supprimer_evenement)
+        btn_supprimer.setStyleSheet(f"background-color: {COLOR_DANGER}; color: white; padding: 8px;")
+        actions_layout.addWidget(btn_supprimer)
+        
+        layout.addLayout(actions_layout)
         
         # Tableau des événements
         self.table_events = QTableWidget()
@@ -116,6 +123,7 @@ class MainWindow(QMainWindow):
         self.table_events.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table_events.setSelectionBehavior(QTableWidget.SelectRows)
         self.table_events.itemSelectionChanged.connect(self.on_event_selected)
+        self.table_events.cellClicked.connect(self.on_table_cell_clicked)
         layout.addWidget(self.table_events)
         
         tab.setLayout(layout)
@@ -371,49 +379,8 @@ class MainWindow(QMainWindow):
     
     # ============= ÉVÉNEMENTS =============
     
-    def choisir_template(self):
-        """Choisir un fichier template"""
-        try:
-            fichier, _ = SimpleFileSelector.get_open_filename(
-                self, "Choisir un template", str(TEMPLATES_DIR),
-                "Images"
-            )
-            if fichier:
-                self.template_path = fichier
-                QMessageBox.information(self, "Template", f"Template sélectionné:\n{fichier}")
-        except Exception as e:
-            QMessageBox.critical(self, "Erreur", f"Erreur lors du choix du template:\n{str(e)}")
-            print(f"Erreur choisir_template: {e}")
-            import traceback
-            traceback.print_exc()
-    
-    def editer_template(self):
-        """Ouvrir l'éditeur de template"""
-        try:
-            print("=== Début editer_template ===")
-            
-            # Créer l'éditeur complet
-            print("Création de l'éditeur...")
-            editor = TemplateEditorDialog(parent=self)
-            
-            # Charger le template si déjà sélectionné
-            if self.template_path:
-                print(f"Chargement du template: {self.template_path}")
-                editor.load_template(self.template_path)
-            
-            print("Affichage de l'éditeur...")
-            editor.exec_()
-            print("=== Fin editer_template ===")
-            
-        except Exception as e:
-            QMessageBox.critical(self, "Erreur", f"Erreur lors de l'ouverture de l'éditeur:\n{str(e)}")
-            print(f"ERREUR editer_template: {e}")
-            import traceback
-            traceback.print_exc()
-
-    
     def ajouter_evenement(self):
-        """Ajouter un nouvel événement"""
+        """Ajouter un nouvel événement ou modifier un existant"""
         nom = self.event_nom.text().strip()
         if not nom:
             QMessageBox.warning(self, "Erreur", "Le nom de l'événement est requis")
@@ -424,20 +391,201 @@ class MainWindow(QMainWindow):
         lieu = self.event_lieu.text().strip()
         organisateur = self.event_organisateur.text().strip()
         
-        event_id = self.db.ajouter_evenement(
-            nom, date, heure, lieu, organisateur,
-            template_path=self.template_path
+        # Vérifier si on est en mode modification
+        if self.event_id_en_cours:
+            # Mode modification
+            success = self.db.modifier_evenement(
+                self.event_id_en_cours, nom, date, heure, lieu, organisateur
+            )
+            if success:
+                QMessageBox.information(self, "Succès", f"Événement '{nom}' modifié!")
+                self.event_id_en_cours = None
+            else:
+                QMessageBox.critical(self, "Erreur", "Erreur lors de la modification")
+        else:
+            # Mode ajout
+            event_id = self.db.ajouter_evenement(
+                nom, date, heure, lieu, organisateur
+            )
+            if event_id:
+                QMessageBox.information(self, "Succès", f"Événement '{nom}' ajouté!")
+            else:
+                QMessageBox.critical(self, "Erreur", "Erreur lors de l'ajout")
+        
+        # Réinitialiser le formulaire
+        self.event_nom.clear()
+        self.event_lieu.clear()
+        self.event_organisateur.clear()
+        self.event_id_en_cours = None
+        self.rafraichir_evenements()
+    
+    def preparer_modification_evenement(self):
+        """Préparer le formulaire pour modifier l'événement sélectionné"""
+        selected = self.table_events.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Erreur", "Veuillez sélectionner un événement à modifier")
+            return
+        
+        row = selected[0].row()
+        event_id = int(self.table_events.item(row, 0).text())
+        
+        # Récupérer les données de l'événement
+        event = self.db.obtenir_evenement(event_id)
+        if not event:
+            QMessageBox.critical(self, "Erreur", "Événement introuvable")
+            return
+        
+        # Remplir le formulaire avec les données existantes
+        self.event_id_en_cours = event_id
+        self.event_nom.setText(event['nom'])
+        self.event_date.setDate(QDate.fromString(event['date'], "yyyy-MM-dd"))
+        self.event_heure.setTime(QTime.fromString(event['heure'], "HH:mm"))
+        self.event_lieu.setText(event['lieu'] or '')
+        self.event_organisateur.setText(event['organisateur'] or '')
+        
+        QMessageBox.information(self, "Mode Modification", 
+                               f"Vous êtes en mode modification pour l'événement '{event['nom']}'.\n\n"
+                               "Modifiez les champs souhaités puis cliquez sur 'Ajouter' pour enregistrer.\n"
+                               "Pour modifier le template, utilisez la colonne Template dans le tableau.")
+    
+    def supprimer_evenement(self):
+        """Supprimer l'événement sélectionné"""
+        selected = self.table_events.selectedItems()
+        if not selected:
+            QMessageBox.warning(self, "Erreur", "Veuillez sélectionner un événement à supprimer")
+            return
+        
+        row = selected[0].row()
+        event_id = int(self.table_events.item(row, 0).text())
+        event_nom = self.table_events.item(row, 1).text()
+        
+        # Demander confirmation
+        reponse = QMessageBox.question(
+            self, "Confirmation", 
+            f"Êtes-vous sûr de vouloir supprimer l'événement '{event_nom}' ?\n\n"
+            "⚠️ ATTENTION: Tous les invités associés seront également supprimés!",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
         )
         
-        if event_id:
-            QMessageBox.information(self, "Succès", f"Événement '{nom}' ajouté!")
-            self.event_nom.clear()
-            self.event_lieu.clear()
-            self.event_organisateur.clear()
-            self.template_path = None
-            self.rafraichir_evenements()
-        else:
-            QMessageBox.critical(self, "Erreur", "Erreur lors de l'ajout")
+        if reponse == QMessageBox.Yes:
+            success = self.db.supprimer_evenement(event_id)
+            if success:
+                QMessageBox.information(self, "Succès", f"Événement '{event_nom}' supprimé!")
+                self.rafraichir_evenements()
+            else:
+                QMessageBox.critical(self, "Erreur", "Erreur lors de la suppression")
+    
+    def changer_template_evenement(self, event_id, dialog):
+        """Changer le template d'un événement existant"""
+        try:
+            fichier, _ = SimpleFileSelector.get_open_filename(
+                self, "Choisir un nouveau template", str(TEMPLATES_DIR),
+                "Images"
+            )
+            if fichier:
+                # Récupérer l'événement
+                event = self.db.obtenir_evenement(event_id)
+                if event:
+                    # Mettre à jour le template
+                    success = self.db.modifier_evenement(
+                        event_id, 
+                        event['nom'], 
+                        event['date'], 
+                        event['heure'], 
+                        event['lieu'], 
+                        event['organisateur'] or '',
+                        template_path=fichier
+                    )
+                    if success:
+                        from pathlib import Path
+                        QMessageBox.information(self, "Succès", 
+                                              f"Template mis à jour !\n\n"
+                                              f"Nouveau template : {Path(fichier).name}")
+                        self.rafraichir_evenements()
+                        dialog.close()
+                    else:
+                        QMessageBox.critical(self, "Erreur", "Erreur lors de la mise à jour")
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Erreur:\n{str(e)}")
+            print(f"Erreur changer_template_evenement: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def editer_template_evenement(self, event_id, template_path, dialog):
+        """Éditer le template d'un événement"""
+        try:
+            if not template_path:
+                QMessageBox.warning(self, "Aucun template", "Cet événement n'a pas de template.")
+                return
+            
+            from pathlib import Path
+            if not Path(template_path).exists():
+                QMessageBox.warning(self, "Fichier introuvable", 
+                                  f"Le template n'existe plus :\n{template_path}\n\n"
+                                  "Veuillez choisir un nouveau template.")
+                return
+            
+            # Fermer le dialogue
+            dialog.close()
+            
+            # Ouvrir l'éditeur
+            editor = TemplateEditorDialog(parent=self)
+            editor.load_template(template_path)
+            editor.exec_()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Erreur:\n{str(e)}")
+            print(f"Erreur editer_template_evenement: {e}")
+            import traceback
+            traceback.print_exc()
+    
+    def voir_template(self, template_path):
+        """Afficher le template dans une fenêtre"""
+        try:
+            from pathlib import Path
+            if not Path(template_path).exists():
+                QMessageBox.warning(self, "Fichier introuvable", 
+                                  f"Le template n'existe plus :\n{template_path}")
+                return
+            
+            # Créer un dialogue pour afficher l'image
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QScrollArea
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Aperçu - {Path(template_path).name}")
+            dialog.setMinimumSize(800, 600)
+            
+            layout = QVBoxLayout()
+            
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            
+            label = QLabel()
+            pixmap = QPixmap(str(template_path))
+            
+            # Redimensionner si trop grand
+            if pixmap.width() > 1200 or pixmap.height() > 800:
+                pixmap = pixmap.scaled(1200, 800, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            
+            label.setPixmap(pixmap)
+            label.setAlignment(Qt.AlignCenter)
+            
+            scroll.setWidget(label)
+            layout.addWidget(scroll)
+            
+            btn_fermer = QPushButton("Fermer")
+            btn_fermer.clicked.connect(dialog.close)
+            layout.addWidget(btn_fermer)
+            
+            dialog.setLayout(layout)
+            dialog.exec_()
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Erreur", f"Erreur lors de l'affichage:\n{str(e)}")
+            print(f"Erreur voir_template: {e}")
+            import traceback
+            traceback.print_exc()
     
     def rafraichir_evenements(self):
         """Rafraîchir la liste des événements"""
@@ -451,7 +599,25 @@ class MainWindow(QMainWindow):
             self.table_events.setItem(i, 3, QTableWidgetItem(event['heure']))
             self.table_events.setItem(i, 4, QTableWidgetItem(event['lieu'] or ''))
             self.table_events.setItem(i, 5, QTableWidgetItem(event['organisateur'] or ''))
-            self.table_events.setItem(i, 6, QTableWidgetItem(event['template_path'] or 'Aucun'))
+            
+            # Colonne template avec style cliquable
+            template_item = QTableWidgetItem(event['template_path'] or '❌ Aucun')
+            if event['template_path']:
+                from pathlib import Path
+                nom_fichier = Path(event['template_path']).name
+                template_item.setText(f"🖼️ {nom_fichier}")
+                template_item.setForeground(QColor("#2E86AB"))
+                template_item.setToolTip("Cliquez pour modifier le template")
+            else:
+                template_item.setForeground(QColor("#D62246"))
+                template_item.setToolTip("Cliquez pour ajouter un template")
+            
+            # Rendre la cellule cliquable visuellement
+            font = template_item.font()
+            font.setUnderline(True)
+            template_item.setFont(font)
+            
+            self.table_events.setItem(i, 6, template_item)
         
         # Mettre à jour les combos
         self.combo_events.clear()
@@ -463,6 +629,57 @@ class MainWindow(QMainWindow):
             self.combo_events.addItem(text, event['id'])
             self.combo_events_gen.addItem(text, event['id'])
             self.combo_events_stats.addItem(text, event['id'])
+    
+    def on_table_cell_clicked(self, row, column):
+        """Gérer le clic sur une cellule du tableau"""
+        # Colonne 6 = Template
+        if column == 6:
+            event_id = int(self.table_events.item(row, 0).text())
+            event_nom = self.table_events.item(row, 1).text()
+            
+            # Afficher un dialogue pour choisir l'action
+            from PyQt5.QtWidgets import QDialog, QVBoxLayout, QLabel, QPushButton
+            
+            dialog = QDialog(self)
+            dialog.setWindowTitle(f"Template - {event_nom}")
+            dialog.setMinimumWidth(400)
+            
+            layout = QVBoxLayout()
+            
+            # Titre
+            titre = QLabel(f"<h3>Gestion du template</h3>")
+            titre.setAlignment(Qt.AlignCenter)
+            layout.addWidget(titre)
+            
+            # Info événement
+            info = QLabel(f"<b>Événement :</b> {event_nom}")
+            layout.addWidget(info)
+            
+            # Boutons d'action
+            btn_choisir = QPushButton("📁 Choisir/Changer le template")
+            btn_choisir.setStyleSheet("background-color: #2E86AB; color: white; padding: 10px; font-size: 14px;")
+            btn_choisir.clicked.connect(lambda: self.changer_template_evenement(event_id, dialog))
+            layout.addWidget(btn_choisir)
+            
+            # Récupérer le template actuel
+            event = self.db.obtenir_evenement(event_id)
+            if event and event['template_path']:
+                btn_editer = QPushButton("🎨 Éditer le template actuel")
+                btn_editer.setStyleSheet("background-color: #F77F00; color: white; padding: 10px; font-size: 14px;")
+                btn_editer.clicked.connect(lambda: self.editer_template_evenement(event_id, event['template_path'], dialog))
+                layout.addWidget(btn_editer)
+                
+                btn_voir = QPushButton("👁️ Voir le template")
+                btn_voir.setStyleSheet("background-color: #06A77D; color: white; padding: 10px; font-size: 14px;")
+                btn_voir.clicked.connect(lambda: self.voir_template(event['template_path']))
+                layout.addWidget(btn_voir)
+            
+            btn_annuler = QPushButton("Annuler")
+            btn_annuler.clicked.connect(dialog.close)
+            layout.addWidget(btn_annuler)
+            
+            dialog.setLayout(layout)
+            dialog.exec_()
     
     def on_event_selected(self):
         """Quand un événement est sélectionné"""

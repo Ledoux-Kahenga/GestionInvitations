@@ -1,0 +1,36 @@
+{
+  "template_path": "C:\\Projets\\GestionInvitations\\templates\\Invitation.png",
+  "template_width": 1659,
+  "template_height": 591,
+  "scale_factor": 1.0,
+  "elements": [
+    {
+      "id": "nom_complet",
+      "label": "Nom Complet",
+      "type": "text",
+      "x": 362,
+      "y": 297,
+      "width": 500,
+      "height": 83,
+      "font_size": 55,
+      "font_name": "C:\\Projets\\GestionInvitations\\fonts\\DeliusUnicase-Bold.ttf",
+      "color": "#e86a2f",
+      "qr_bg_color": "#FFFFFF",
+      "qr_fill_color": "#000000"
+    },
+    {
+      "id": "qrcode",
+      "label": "QR Code",
+      "type": "qr",
+      "x": 1338,
+      "y": 293,
+      "width": 220,
+      "height": 220,
+      "font_size": 40,
+      "font_name": "",
+      "color": "#1b2d59",
+      "qr_bg_color": "#ef6d31",
+      "qr_fill_color": "#1b2d59"
+    }
+  ]
+}

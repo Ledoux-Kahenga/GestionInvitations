@@ -5,8 +5,9 @@ from PIL import Image, ImageDraw, ImageFont
 import qrcode
 import uuid
 import json
+import os
 from pathlib import Path
-from config import INVITATIONS_DIR, QRCODES_DIR, QR_CONFIG, INVITATION_CONFIG
+from config import INVITATIONS_DIR, QRCODES_DIR, QR_CONFIG, INVITATION_CONFIG, FONTS_DIR, DEFAULT_FONTS
 
 
 class InvitationGenerator:
@@ -73,13 +74,15 @@ class InvitationGenerator:
             print("   Utilisation du mode par défaut")
             return False
     
-    def generer_qr_code(self, data, taille=200):
+    def generer_qr_code(self, data, taille=200, fill_color="black", back_color="white"):
         """
         Générer un QR code
         
         Args:
             data: Données à encoder (ID unique de l'invité)
             taille: Taille du QR code en pixels
+            fill_color: Couleur des éléments du QR code (hex ou nom)
+            back_color: Couleur de fond du QR code (hex ou nom)
         
         Returns:
             Image PIL du QR code
@@ -93,10 +96,52 @@ class InvitationGenerator:
         qr.add_data(data)
         qr.make(fit=True)
         
-        qr_img = qr.make_image(fill_color="black", back_color="white")
+        qr_img = qr.make_image(fill_color=fill_color, back_color=back_color)
         qr_img = qr_img.resize((taille, taille))
         
         return qr_img
+    
+    def charger_police(self, font_name, font_size):
+        """
+        Charger une police TrueType
+        
+        Args:
+            font_name: Chemin de la police ou vide pour police par défaut
+            font_size: Taille de la police
+        
+        Returns:
+            Objet ImageFont
+        """
+        # Si une police spécifique est demandée
+        if font_name and Path(font_name).exists():
+            try:
+                font = ImageFont.truetype(font_name, font_size)
+                print(f"✅ Police chargée: {Path(font_name).name}")
+                return font
+            except Exception as e:
+                print(f"⚠️ Erreur chargement police {font_name}: {e}")
+        
+        # Sinon, essayer les polices par défaut
+        # Windows
+        if os.name == 'nt':
+            for font_file in DEFAULT_FONTS['windows']:
+                try:
+                    font = ImageFont.truetype(font_file, font_size)
+                    return font
+                except:
+                    continue
+        
+        # Linux
+        for font_path in DEFAULT_FONTS['linux']:
+            try:
+                font = ImageFont.truetype(font_path, font_size)
+                return font
+            except:
+                continue
+        
+        # Dernier recours : police par défaut
+        print("⚠️ Utilisation de la police par défaut")
+        return ImageFont.load_default()
     
     def sauvegarder_qr_code(self, qr_img, invite_id):
         """Sauvegarder le QR code"""
@@ -151,7 +196,9 @@ class InvitationGenerator:
         
         # Sauvegarder l'invitation
         if save_path is None:
-            save_path = INVITATIONS_DIR / f"invitation_{invite_data['id']}.jpg"
+            # Créer le nom composé : Invitation-NomComplet
+            nom_complet = f"{invite_data['prenom']}_{invite_data['nom']}".replace(" ", "_")
+            save_path = INVITATIONS_DIR / f"Invitation-{nom_complet}.jpg"
         
         invitation.save(save_path, quality=INVITATION_CONFIG['quality'], dpi=(INVITATION_CONFIG['dpi'], INVITATION_CONFIG['dpi']))
         
@@ -178,35 +225,44 @@ class InvitationGenerator:
             elem_type = elem['type']
             
             if elem_type == 'qr' and elem_id == 'qrcode':
-                # Redimensionner et coller le QR code
-                qr_resized = qr_img.resize((elem['width'], elem['height']))
-                invitation.paste(qr_resized, (elem['x'], elem['y']))
+                # Récupérer les couleurs personnalisées
+                qr_fill_color = elem.get('qr_fill_color', '#000000')
+                qr_bg_color = elem.get('qr_bg_color', '#FFFFFF')
+                
+                # Régénérer le QR code avec les couleurs personnalisées
+                width = max(50, elem['width'])  # Minimum 50px
+                height = max(50, elem['height'])  # Minimum 50px
+                qr_custom = self.generer_qr_code(qr_data, taille=max(width, height), 
+                                                 fill_color=qr_fill_color, 
+                                                 back_color=qr_bg_color)
+                qr_resized = qr_custom.resize((width, height))
+                x = max(0, elem['x'])
+                y = max(0, elem['y'])
+                invitation.paste(qr_resized, (x, y))
+                print(f"✅ QR Code collé à ({x}, {y}) taille {width}x{height} (fond:{qr_bg_color}, éléments:{qr_fill_color})")
             
             elif elem_type == 'text' and elem_id in data_map:
                 # Dessiner le texte
-                try:
-                    font = ImageFont.truetype(
-                        "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                        elem.get('font_size', 40)
-                    )
-                except:
-                    font = ImageFont.load_default()
+                font = self.charger_police(elem.get('font_name', ''), elem.get('font_size', 40))
                 
                 # Convertir la couleur hex en RGB
                 color = elem.get('color', '#000000')
                 if color.startswith('#'):
                     color = tuple(int(color[i:i+2], 16) for i in (1, 3, 5))
                 
-                # Centrer le texte dans la zone
+                # Positionner le texte depuis le coin inférieur gauche de la zone
                 text = str(data_map[elem_id])
-                bbox = draw.textbbox((0, 0), text, font=font)
-                text_width = bbox[2] - bbox[0]
-                text_height = bbox[3] - bbox[1]
+                x = max(0, elem['x'])
+                y = max(0, elem['y'])
                 
-                text_x = elem['x'] + (elem['width'] - text_width) // 2
-                text_y = elem['y'] + (elem['height'] - text_height) // 2
+                # Position du texte : coin inférieur gauche de la zone
+                # y + height correspond au bas de la zone
+                text_x = x
+                text_y = y + elem['height']
                 
-                draw.text((text_x, text_y), text, fill=color, font=font)
+                # Utiliser anchor='lb' (left-bottom) pour positionner depuis le coin inférieur gauche
+                draw.text((text_x, text_y), text, fill=color, font=font, anchor='lb')
+                print(f"✅ Texte '{elem_id}' dessiné à ({text_x}, {text_y}) [coin inférieur gauche]")
     
     def appliquer_mode_defaut(self, invitation, draw, invite_data, qr_img, qr_data):
         """Appliquer le mode par défaut (ancien comportement)"""

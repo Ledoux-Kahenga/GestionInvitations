@@ -117,6 +117,29 @@ class InvitationModel:
         self.disconnect()
         return evenement
     
+    def modifier_evenement(self, evenement_id, nom, date, heure, lieu, organisateur="", description="", template_path=""):
+        """Modifier un événement existant"""
+        self.connect()
+        self.cursor.execute('''
+            UPDATE evenements 
+            SET nom = ?, date = ?, heure = ?, lieu = ?, organisateur = ?, description = ?, template_path = ?
+            WHERE id = ?
+        ''', (nom, date, heure, lieu, organisateur, description, template_path, evenement_id))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
+    def supprimer_evenement(self, evenement_id):
+        """Supprimer un événement et tous ses invités"""
+        self.connect()
+        # Supprimer d'abord les invités associés
+        self.cursor.execute("DELETE FROM invites WHERE evenement_id = ?", (evenement_id,))
+        # Puis supprimer l'événement
+        self.cursor.execute("DELETE FROM evenements WHERE id = ?", (evenement_id,))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
     # === INVITÉS ===
     
     def ajouter_invite(self, evenement_id, nom, prenom, email="", telephone="", 

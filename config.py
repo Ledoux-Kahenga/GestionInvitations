@@ -10,11 +10,20 @@ TEMPLATES_DIR = BASE_DIR / "templates"
 INVITATIONS_DIR = BASE_DIR / "invitations_generees"
 QRCODES_DIR = BASE_DIR / "qrcodes"
 DATABASE_DIR = BASE_DIR / "database"
+FONTS_DIR = BASE_DIR / "fonts"
 DATABASE_PATH = DATABASE_DIR / "invitations.db"
 
 # Créer les dossiers s'ils n'existent pas
-for dir_path in [TEMPLATES_DIR, INVITATIONS_DIR, QRCODES_DIR, DATABASE_DIR]:
+for dir_path in [TEMPLATES_DIR, INVITATIONS_DIR, QRCODES_DIR, DATABASE_DIR, FONTS_DIR]:
     dir_path.mkdir(exist_ok=True)
+
+# Polices par défaut
+DEFAULT_FONTS = {
+    'windows': ['arial.ttf', 'times.ttf', 'calibri.ttf', 'comic.ttf'],
+    'linux': ['/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf',
+              '/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf',
+              '/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf']
+}
 
 # Configuration des invitations
 INVITATION_CONFIG = {
