@@ -1,0 +1,16 @@
+{
+  "template_path": "/home/doux/Projets/GestionInvitations/templates/PhotoInvitation.jpg",
+  "elements": [
+    {
+      "id": "nom_complet",
+      "label": "Nom Complet",
+      "type": "text",
+      "x": 1199,
+      "y": 1037,
+      "width": 1044,
+      "height": 35,
+      "font_size": 40,
+      "color": "#000000"
+    }
+  ]
+}
