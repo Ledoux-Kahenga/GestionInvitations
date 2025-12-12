@@ -43,26 +43,144 @@ class InvitationModel:
             )
         ''')
         
-        # Table des invités
+        # Table des tables (placement) - DOIT être créée avant invites pour foreign key
         self.cursor.execute('''
-            CREATE TABLE IF NOT EXISTS invites (
+            CREATE TABLE IF NOT EXISTS tables (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 evenement_id INTEGER NOT NULL,
-                nom TEXT NOT NULL,
-                prenom TEXT NOT NULL,
-                email TEXT,
-                telephone TEXT,
-                nombre_accompagnants INTEGER DEFAULT 0,
-                categorie TEXT,
-                qr_code TEXT UNIQUE,
-                invitation_path TEXT,
-                statut TEXT DEFAULT 'en_attente',
-                date_envoi TEXT,
-                date_scan TEXT,
+                nom_table TEXT NOT NULL,
+                cote TEXT NOT NULL,
+                capacite INTEGER DEFAULT 10,
+                description TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (evenement_id) REFERENCES evenements(id)
             )
         ''')
+        
+        # Vérifier si la table invites existe déjà
+        self.cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='invites'")
+        table_exists = self.cursor.fetchone()
+        
+        if table_exists:
+            # Vérifier si les anciennes colonnes existent
+            self.cursor.execute("PRAGMA table_info(invites)")
+            columns = [col[1] for col in self.cursor.fetchall()]
+            
+            if 'nom' in columns and 'prenom' in columns:
+                # Migration nécessaire: ancien schéma détecté
+                print("Migration de la base de données détectée...")
+                
+                # Créer une table temporaire avec le nouveau schéma
+                self.cursor.execute('''
+                    CREATE TABLE invites_new (
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,
+                        evenement_id INTEGER NOT NULL,
+                        civilite TEXT NOT NULL DEFAULT 'Mr',
+                        nom_complet TEXT NOT NULL,
+                        table_id INTEGER,
+                        email TEXT,
+                        telephone TEXT,
+                        nombre_accompagnants INTEGER DEFAULT 0,
+                        categorie TEXT,
+                        qr_code TEXT UNIQUE,
+                        invitation_path TEXT,
+                        statut TEXT DEFAULT 'en_attente',
+                        date_envoi TEXT,
+                        date_scan TEXT,
+                        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                        FOREIGN KEY (evenement_id) REFERENCES evenements(id),
+                        FOREIGN KEY (table_id) REFERENCES tables(id)
+                    )
+                ''')
+                
+                # Copier les données avec transformation
+                self.cursor.execute('''
+                    INSERT INTO invites_new (
+                        id, evenement_id, civilite, nom_complet, table_id, 
+                        email, telephone, nombre_accompagnants, categorie, 
+                        qr_code, invitation_path, statut, date_envoi, date_scan, created_at
+                    )
+                    SELECT 
+                        id, evenement_id, 'Mr', 
+                        CASE 
+                            WHEN prenom IS NOT NULL AND prenom != '' 
+                            THEN prenom || ' ' || nom 
+                            ELSE nom 
+                        END as nom_complet,
+                        NULL,
+                        email, telephone, nombre_accompagnants, categorie, 
+                        qr_code, invitation_path, statut, date_envoi, date_scan, created_at
+                    FROM invites
+                ''')
+                
+                # Supprimer l'ancienne table et renommer la nouvelle
+                self.cursor.execute("DROP TABLE invites")
+                self.cursor.execute("ALTER TABLE invites_new RENAME TO invites")
+                print("Migration terminée avec succès!")
+            elif 'civilite' in columns and 'table_id' not in columns:
+                # Colonne civilite existe mais pas table_id: migration partielle nécessaire
+                print("Ajout de la colonne table_id...")
+                self.cursor.execute("ALTER TABLE invites ADD COLUMN table_id INTEGER REFERENCES tables(id)")
+                # Supprimer la colonne nom_table si elle existe
+                self.cursor.execute("PRAGMA table_info(invites)")
+                columns = [col[1] for col in self.cursor.fetchall()]
+                if 'nom_table' in columns:
+                    # SQLite ne supporte pas DROP COLUMN avant version 3.35.0
+                    # On va créer une nouvelle table sans nom_table
+                    self.cursor.execute('''
+                        CREATE TABLE invites_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            evenement_id INTEGER NOT NULL,
+                            civilite TEXT NOT NULL DEFAULT 'Mr',
+                            nom_complet TEXT NOT NULL,
+                            table_id INTEGER,
+                            email TEXT,
+                            telephone TEXT,
+                            nombre_accompagnants INTEGER DEFAULT 0,
+                            categorie TEXT,
+                            qr_code TEXT UNIQUE,
+                            invitation_path TEXT,
+                            statut TEXT DEFAULT 'en_attente',
+                            date_envoi TEXT,
+                            date_scan TEXT,
+                            created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                            FOREIGN KEY (evenement_id) REFERENCES evenements(id),
+                            FOREIGN KEY (table_id) REFERENCES tables(id)
+                        )
+                    ''')
+                    self.cursor.execute('''
+                        INSERT INTO invites_new 
+                        SELECT id, evenement_id, civilite, nom_complet, NULL, 
+                               email, telephone, nombre_accompagnants, categorie, 
+                               qr_code, invitation_path, statut, date_envoi, date_scan, created_at
+                        FROM invites
+                    ''')
+                    self.cursor.execute("DROP TABLE invites")
+                    self.cursor.execute("ALTER TABLE invites_new RENAME TO invites")
+                print("Colonne table_id ajoutée!")
+        else:
+            # Table invites n'existe pas: création avec le nouveau schéma
+            self.cursor.execute('''
+                CREATE TABLE invites (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    evenement_id INTEGER NOT NULL,
+                    civilite TEXT NOT NULL DEFAULT 'Mr',
+                    nom_complet TEXT NOT NULL,
+                    table_id INTEGER,
+                    email TEXT,
+                    telephone TEXT,
+                    nombre_accompagnants INTEGER DEFAULT 0,
+                    categorie TEXT,
+                    qr_code TEXT UNIQUE,
+                    invitation_path TEXT,
+                    statut TEXT DEFAULT 'en_attente',
+                    date_envoi TEXT,
+                    date_scan TEXT,
+                    created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (evenement_id) REFERENCES evenements(id),
+                    FOREIGN KEY (table_id) REFERENCES tables(id)
+                )
+            ''')
         
         # Table des scans (historique)
         self.cursor.execute('''
@@ -134,23 +252,147 @@ class InvitationModel:
         self.connect()
         # Supprimer d'abord les invités associés
         self.cursor.execute("DELETE FROM invites WHERE evenement_id = ?", (evenement_id,))
+        # Supprimer les tables associées
+        self.cursor.execute("DELETE FROM tables WHERE evenement_id = ?", (evenement_id,))
         # Puis supprimer l'événement
         self.cursor.execute("DELETE FROM evenements WHERE id = ?", (evenement_id,))
         self.conn.commit()
         self.disconnect()
         return True
     
-    # === INVITÉS ===
+    # === TABLES ===
     
-    def ajouter_invite(self, evenement_id, nom, prenom, email="", telephone="", 
-                       nombre_accompagnants=0, categorie="Standard", qr_code=None):
-        """Ajouter un invité"""
+    def ajouter_table(self, evenement_id, nom_table, cote, capacite=10, description=""):
+        """Ajouter une nouvelle table"""
         self.connect()
         self.cursor.execute('''
-            INSERT INTO invites (evenement_id, nom, prenom, email, telephone, 
+            INSERT INTO tables (evenement_id, nom_table, cote, capacite, description)
+            VALUES (?, ?, ?, ?, ?)
+        ''', (evenement_id, nom_table, cote, capacite, description))
+        table_id = self.cursor.lastrowid
+        self.conn.commit()
+        self.disconnect()
+        return table_id
+    
+    def obtenir_tables(self, evenement_id):
+        """Obtenir toutes les tables d'un événement"""
+        self.connect()
+        self.cursor.execute('''
+            SELECT id, evenement_id, nom_table, cote, capacite, description, created_at
+            FROM tables
+            WHERE evenement_id = ?
+            ORDER BY cote, nom_table
+        ''', (evenement_id,))
+        tables = self.cursor.fetchall()
+        self.disconnect()
+        return tables
+    
+    def obtenir_table(self, table_id):
+        """Obtenir une table par ID"""
+        self.connect()
+        self.cursor.execute('''
+            SELECT id, evenement_id, nom_table, cote, capacite, description, created_at
+            FROM tables
+            WHERE id = ?
+        ''', (table_id,))
+        table = self.cursor.fetchone()
+        self.disconnect()
+        return table
+    
+    def modifier_table(self, table_id, nom_table, cote, capacite=10, description=""):
+        """Modifier une table existante"""
+        self.connect()
+        self.cursor.execute('''
+            UPDATE tables 
+            SET nom_table = ?, cote = ?, capacite = ?, description = ?
+            WHERE id = ?
+        ''', (nom_table, cote, capacite, description, table_id))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
+    def supprimer_table(self, table_id):
+        """Supprimer une table (met à NULL les invités associés)"""
+        self.connect()
+        # Mettre à NULL les invités qui référencent cette table
+        self.cursor.execute("UPDATE invites SET table_id = NULL WHERE table_id = ?", (table_id,))
+        # Supprimer la table
+        self.cursor.execute("DELETE FROM tables WHERE id = ?", (table_id,))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
+    def verifier_capacite_table(self, table_id):
+        """Vérifier si une table a encore de la place disponible
+        Retourne (places_occupees, capacite_totale, places_disponibles)"""
+        self.connect()
+        
+        # Obtenir la capacité de la table
+        self.cursor.execute('''
+            SELECT capacite FROM tables WHERE id = ?
+        ''', (table_id,))
+        result = self.cursor.fetchone()
+        
+        if not result:
+            self.disconnect()
+            return None
+        
+        capacite_totale = result['capacite']
+        
+        # Compter le nombre de places occupées (invité + accompagnants)
+        self.cursor.execute('''
+            SELECT SUM(1 + nombre_accompagnants) as places_occupees
+            FROM invites
+            WHERE table_id = ?
+        ''', (table_id,))
+        result = self.cursor.fetchone()
+        places_occupees = result['places_occupees'] or 0
+        
+        self.disconnect()
+        
+        places_disponibles = capacite_totale - places_occupees
+        return (places_occupees, capacite_totale, places_disponibles)
+    
+    def obtenir_tables_avec_places(self, evenement_id):
+        """Obtenir toutes les tables avec le nombre de places occupées et disponibles"""
+        self.connect()
+        self.cursor.execute('''
+            SELECT 
+                t.id, 
+                t.evenement_id, 
+                t.nom_table, 
+                t.cote, 
+                t.capacite, 
+                t.description, 
+                t.created_at,
+                COALESCE(SUM(1 + i.nombre_accompagnants), 0) as places_occupees
+            FROM tables t
+            LEFT JOIN invites i ON t.id = i.table_id
+            WHERE t.evenement_id = ?
+            GROUP BY t.id, t.nom_table, t.cote, t.capacite, t.description, t.created_at
+            ORDER BY t.cote, t.nom_table
+        ''', (evenement_id,))
+        tables = self.cursor.fetchall()
+        self.disconnect()
+        return tables
+    
+    # === INVITÉS ===
+    
+    def ajouter_invite(self, evenement_id, civilite, nom_complet, table_id=None, email="", telephone="", 
+                      nombre_accompagnants=0, categorie="Standard", qr_code=""):
+        """Ajouter un nouvel invité"""
+        import uuid
+        
+        # Générer un QR code unique si non fourni
+        if not qr_code:
+            qr_code = f"INVITE-TEMP-{uuid.uuid4().hex[:12]}"
+        
+        self.connect()
+        self.cursor.execute('''
+            INSERT INTO invites (evenement_id, civilite, nom_complet, table_id, email, telephone, 
                                nombre_accompagnants, categorie, qr_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (evenement_id, nom, prenom, email, telephone, nombre_accompagnants, categorie, qr_code))
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (evenement_id, civilite, nom_complet, table_id, email, telephone, nombre_accompagnants, categorie, qr_code))
         invite_id = self.cursor.lastrowid
         self.conn.commit()
         self.disconnect()
@@ -161,34 +403,39 @@ class InvitationModel:
         self.connect()
         if evenement_id:
             self.cursor.execute('''
-                SELECT id, evenement_id, nom, prenom, email, telephone, 
-                       nombre_accompagnants, categorie, qr_code, invitation_path, 
-                       statut, date_envoi, date_scan, created_at
-                FROM invites
-                WHERE evenement_id = ?
-                ORDER BY nom, prenom
+                SELECT i.id, i.evenement_id, i.civilite, i.nom_complet, t.nom_table, 
+                       i.email, i.telephone, i.nombre_accompagnants, i.categorie, 
+                       i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at
+                FROM invites i
+                LEFT JOIN tables t ON i.table_id = t.id
+                WHERE i.evenement_id = ?
+                ORDER BY i.nom_complet
             ''', (evenement_id,))
         else:
             self.cursor.execute('''
-                SELECT id, evenement_id, nom, prenom, email, telephone, 
-                       nombre_accompagnants, categorie, qr_code, invitation_path, 
-                       statut, date_envoi, date_scan, created_at
-                FROM invites
-                ORDER BY created_at DESC
+                SELECT i.id, i.evenement_id, i.civilite, i.nom_complet, t.nom_table, 
+                       i.email, i.telephone, i.nombre_accompagnants, i.categorie, 
+                       i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at
+                FROM invites i
+                LEFT JOIN tables t ON i.table_id = t.id
+                ORDER BY i.created_at DESC
             ''')
         invites = self.cursor.fetchall()
         self.disconnect()
         return invites
     
     def obtenir_invite_par_qr(self, qr_code):
-        """Obtenir un invité par son QR code"""
+        """Obtenir un invité par son QR code avec infos événement et table"""
         self.connect()
         self.cursor.execute('''
-            SELECT id, evenement_id, nom, prenom, email, telephone, 
-                   nombre_accompagnants, categorie, qr_code, invitation_path, 
-                   statut, date_envoi, date_scan, created_at
-            FROM invites
-            WHERE qr_code = ?
+            SELECT i.id, i.evenement_id, i.civilite, i.nom_complet, t.nom_table, 
+                   i.email, i.telephone, i.nombre_accompagnants, i.categorie, 
+                   i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at,
+                   e.nom as nom_evenement, e.date as date_evenement, e.heure as heure_evenement
+            FROM invites i
+            LEFT JOIN tables t ON i.table_id = t.id
+            LEFT JOIN evenements e ON i.evenement_id = e.id
+            WHERE i.qr_code = ?
         ''', (qr_code,))
         invite = self.cursor.fetchone()
         self.disconnect()
