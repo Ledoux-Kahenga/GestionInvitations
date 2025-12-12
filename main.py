@@ -58,7 +58,8 @@ class MainWindow(QMainWindow):
         
         header_layout.addStretch()
         
-        date_label = QLabel("📅 " + datetime.now().strftime("%d/%m/%Y") + "  🕐 " + datetime.now().strftime("%H:%M"))
+        now = datetime.now()
+        date_label = QLabel("📅 " + now.strftime("%d/%m/%Y") + "  🕐 " + now.strftime("%H:%M"))
         date_label.setStyleSheet("color: white; font-size: 14px; font-weight: bold;")
         header_layout.addWidget(date_label)
         
