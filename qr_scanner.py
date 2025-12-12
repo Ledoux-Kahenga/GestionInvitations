@@ -54,22 +54,33 @@ class QRScanner:
         Valider une invitation via son QR code
         
         Args:
-            qr_code: Code QR scanné
+            qr_code: Code QR scanné (peut contenir les infos formatées ou juste l'ID)
             lieu: Lieu du scan
         
         Returns:
             Dict avec le résultat de la validation
         """
+        # Extraire l'ID technique du QR code
+        # Le QR code peut être soit l'ancien format (INVITE-X-XXX) 
+        # soit le nouveau format (texte multiligne avec ID: à la fin)
+        qr_id = qr_code
+        if '\n' in qr_code and 'ID:' in qr_code:
+            # Nouveau format : extraire la ligne ID:
+            for ligne in qr_code.split('\n'):
+                if ligne.startswith('ID:'):
+                    qr_id = ligne.replace('ID:', '').strip()
+                    break
+        
         # Vérifier si déjà scanné récemment (éviter doubles scans)
-        if qr_code in self.derniers_scans:
+        if qr_id in self.derniers_scans:
             return {
                 'valide': False,
                 'message': '⚠️ QR code déjà scanné récemment',
                 'invite': None
             }
         
-        # Récupérer l'invité
-        invite = self.db.obtenir_invite_par_qr(qr_code)
+        # Récupérer l'invité par l'ID technique
+        invite = self.db.obtenir_invite_par_qr(qr_id)
         
         if not invite:
             return {
@@ -82,7 +93,7 @@ class QRScanner:
         if invite['statut'] == 'présent':
             return {
                 'valide': False,
-                'message': f"⚠️ {invite['prenom']} {invite['nom']} déjà enregistré(e)",
+                'message': f"⚠️ {invite['nom_complet']} déjà enregistré(e)",
                 'invite': invite,
                 'deja_present': True
             }
@@ -91,15 +102,15 @@ class QRScanner:
         scan_success = self.db.enregistrer_scan(invite['id'], lieu)
         
         if scan_success:
-            # Ajouter aux scans récents
-            self.derniers_scans.add(qr_code)
+            # Ajouter aux scans récents (utiliser l'ID technique)
+            self.derniers_scans.add(qr_id)
             
             # Calculer le nombre total de personnes
             nb_personnes = 1 + invite['nombre_accompagnants']
             
             return {
                 'valide': True,
-                'message': f"✅ Bienvenue {invite['prenom']} {invite['nom']}!",
+                'message': f"✅ Bienvenue {invite['nom_complet']}!",
                 'invite': invite,
                 'nb_personnes': nb_personnes,
                 'categorie': invite['categorie']
@@ -160,14 +171,31 @@ class QRScanner:
                 if validation['invite']:
                     invite = validation['invite']
                     y = 100
-                    cv2.putText(frame, f"Nom: {invite['prenom']} {invite['nom']}", 
+                    
+                    # Nom de l'événement
+                    if invite.get('nom_evenement'):
+                        cv2.putText(frame, f"Evenement: {invite['nom_evenement']}", 
+                                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        y += 40
+                    
+                    # Nom complet de l'invité
+                    cv2.putText(frame, f"Invite: {invite['nom_complet']}", 
                                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                     y += 40
-                    cv2.putText(frame, f"Catégorie: {invite['categorie']}", 
+                    
+                    # Table
+                    table_info = invite.get('nom_table') or 'Non assignée'
+                    cv2.putText(frame, f"Table: {table_info}", 
                                (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                    y += 40
+                    
+                    # Date de l'événement
+                    if invite.get('date_evenement'):
+                        cv2.putText(frame, f"Date: {invite['date_evenement']}", 
+                                   (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        y += 40
                     
                     if 'nb_personnes' in validation:
-                        y += 40
                         cv2.putText(frame, f"Personnes: {validation['nb_personnes']}", 
                                    (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
             
@@ -227,7 +255,10 @@ if __name__ == "__main__":
         
         if validation['invite']:
             invite = validation['invite']
-            print(f"Invité: {invite['prenom']} {invite['nom']}")
+            print(f"Événement: {invite.get('nom_evenement', 'N/A')}")
+            print(f"Invité: {invite['nom_complet']}")
+            print(f"Table: {invite.get('nom_table') or 'Non assignée'}")
+            print(f"Date: {invite.get('date_evenement', 'N/A')}")
             print(f"Catégorie: {invite['categorie']}")
     
     try:

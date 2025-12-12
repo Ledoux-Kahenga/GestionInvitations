@@ -157,8 +157,9 @@ class InvitationGenerator:
             invite_data: Dictionnaire avec les infos de l'invité
                 {
                     'id': int,
-                    'nom': str,
-                    'prenom': str,
+                    'civilite': str,
+                    'nom_complet': str,
+                    'nom_table': str,
                     'categorie': str,
                     'evenement': {
                         'nom': str,
@@ -180,8 +181,17 @@ class InvitationGenerator:
         invitation = self.template.copy()
         draw = ImageDraw.Draw(invitation)
         
-        # Générer QR code unique
-        qr_data = f"INVITE-{invite_data['id']}-{uuid.uuid4().hex[:8]}"
+        # Générer QR code avec les informations lisibles
+        evenement = invite_data['evenement']
+        qr_data = (
+            f"Événement: {evenement['nom']}\n"
+            f"Invité: {invite_data.get('nom_complet', 'N/A')}\n"
+            f"Table: {invite_data.get('nom_table') or 'Non assignée'}\n"
+            f"Date: {evenement['date']}\n"
+            f"Heure: {evenement['heure']}\n"
+            f"Lieu: {evenement['lieu']}\n"
+            f"ID: INVITE-{invite_data['id']}-{uuid.uuid4().hex[:8]}"
+        )
         qr_img = self.generer_qr_code(qr_data, taille=300)
         
         # Sauvegarder le QR code séparément
@@ -197,7 +207,7 @@ class InvitationGenerator:
         # Sauvegarder l'invitation
         if save_path is None:
             # Créer le nom composé : Invitation-NomComplet
-            nom_complet = f"{invite_data['prenom']}_{invite_data['nom']}".replace(" ", "_")
+            nom_complet = invite_data.get('nom_complet', 'Invite').replace(" ", "_")
             save_path = INVITATIONS_DIR / f"Invitation-{nom_complet}.jpg"
         
         invitation.save(save_path, quality=INVITATION_CONFIG['quality'], dpi=(INVITATION_CONFIG['dpi'], INVITATION_CONFIG['dpi']))
@@ -208,10 +218,10 @@ class InvitationGenerator:
         """Appliquer la configuration personnalisée"""
         # Mapper les IDs aux données
         data_map = {
-            'nom_complet': f"{invite_data['prenom']} {invite_data['nom']}",
-            'prenom': invite_data['prenom'],
-            'nom': invite_data['nom'],
-            'categorie': invite_data['categorie'],
+            'civilite': invite_data.get('civilite', 'Mr'),
+            'nom_complet': invite_data.get('nom_complet', ''),
+            'nom_table': invite_data.get('nom_table', ''),
+            'categorie': invite_data.get('categorie', 'Standard'),
             'event_nom': invite_data['evenement']['nom'],
             'event_date': invite_data['evenement']['date'],
             'event_heure': invite_data['evenement']['heure'],
@@ -287,7 +297,7 @@ class InvitationGenerator:
         draw.text((width//2, 200), event_nom, fill=(46, 134, 171), font=font_titre, anchor="mm")
         
         # Nom de l'invité (centré)
-        nom_complet = f"{invite_data['prenom']} {invite_data['nom']}"
+        nom_complet = invite_data.get('nom_complet', '')
         draw.text((width//2, 500), nom_complet, fill=(0, 0, 0), font=font_nom, anchor="mm")
         
         # Catégorie
