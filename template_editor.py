@@ -5,13 +5,15 @@ Permet de positionner les éléments (textes, QR code) sur le template
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QPushButton, 
                             QLabel, QScrollArea, QWidget, QComboBox, QSpinBox,
                             QGroupBox, QFormLayout, QColorDialog, QFileDialog,
-                            QMessageBox, QLineEdit)
-from PyQt5.QtCore import Qt, QRect, QPoint
-from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QImage
+                            QMessageBox, QLineEdit, QMenuBar, QMenu, QAction,
+                            QShortcut, QCheckBox)
+from PyQt5.QtCore import Qt, QRect, QPoint, QTimer
+from PyQt5.QtGui import QPixmap, QPainter, QPen, QColor, QFont, QImage, QKeySequence
 from PIL import Image, ImageFont
 import json
 from pathlib import Path
 import os
+import copy
 from config import TEMPLATES_DIR, FONTS_DIR
 from simple_file_selector import SimpleFileSelector
 
@@ -19,13 +21,18 @@ from simple_file_selector import SimpleFileSelector
 class DraggableElement(QLabel):
     """Élément déplaçable sur le canvas (zone de texte ou QR code)"""
     
-    def __init__(self, element_type, name, parent=None):
+    def __init__(self, element_type, name, parent=None, editor=None):
         super().__init__(parent)
         self.element_type = element_type  # 'text' ou 'qr'
         self.name = name
         self.dragging = False
         self.offset = QPoint()
         self.canvas_parent = parent
+        self.editor = editor  # Référence vers l'éditeur principal
+        self.element_data = None  # Référence vers les données de l'élément
+        
+        # Permettre le focus clavier
+        self.setFocusPolicy(Qt.StrongFocus)
         
         # Style visuel
         self.is_selected = False
@@ -90,12 +97,94 @@ class DraggableElement(QLabel):
         """Définir l'état de sélection"""
         self.is_selected = selected
         self.update_style()
+        if selected:
+            self.setFocus()  # Prendre le focus quand sélectionné
+    
+    def keyPressEvent(self, event):
+        """Gérer les touches directionnelles pour déplacer l'élément"""
+        step = 10 if event.modifiers() & Qt.ShiftModifier else 1  # Shift = déplacement rapide
+        
+        # Sauvegarder la position de départ au premier déplacement
+        if not hasattr(self, 'key_move_start_pos'):
+            self.key_move_start_pos = None
+        
+        new_x = self.x()
+        new_y = self.y()
+        handled = False
+        
+        if event.key() == Qt.Key_Left:
+            if self.key_move_start_pos is None:
+                self.key_move_start_pos = self.pos()
+            new_x = max(0, self.x() - step)
+            handled = True
+        elif event.key() == Qt.Key_Right:
+            if self.key_move_start_pos is None:
+                self.key_move_start_pos = self.pos()
+            parent_rect = self.parent().rect()
+            new_x = min(self.x() + step, parent_rect.width() - self.width())
+            handled = True
+        elif event.key() == Qt.Key_Up:
+            if self.key_move_start_pos is None:
+                self.key_move_start_pos = self.pos()
+            new_y = max(0, self.y() - step)
+            handled = True
+        elif event.key() == Qt.Key_Down:
+            if self.key_move_start_pos is None:
+                self.key_move_start_pos = self.pos()
+            parent_rect = self.parent().rect()
+            new_y = min(self.y() + step, parent_rect.height() - self.height())
+            handled = True
+        elif event.key() == Qt.Key_Delete:
+            # Supprimer l'élément
+            if self.editor:
+                self.editor.delete_selected_element()
+            return
+        
+        if handled:
+            self.move(new_x, new_y)
+            self.update_label()
+            
+            # Mettre à jour les spinboxes de position dans l'éditeur
+            if self.editor and hasattr(self.editor, 'prop_x') and hasattr(self.editor, 'prop_y'):
+                scale = self.canvas_parent.scale_factor if self.canvas_parent else 1.0
+                if scale > 0:
+                    self.editor.prop_x.blockSignals(True)
+                    self.editor.prop_y.blockSignals(True)
+                    self.editor.prop_x.setValue(round(new_x / scale))
+                    self.editor.prop_y.setValue(round(new_y / scale))
+                    self.editor.prop_x.blockSignals(False)
+                    self.editor.prop_y.blockSignals(False)
+            
+            event.accept()
+        else:
+            super().keyPressEvent(event)
+    
+    def keyReleaseEvent(self, event):
+        """Sauvegarder l'état après un déplacement au clavier"""
+        if event.key() in (Qt.Key_Left, Qt.Key_Right, Qt.Key_Up, Qt.Key_Down):
+            if hasattr(self, 'key_move_start_pos') and self.key_move_start_pos is not None:
+                if self.pos() != self.key_move_start_pos:
+                    if self.editor and hasattr(self.editor, 'save_state'):
+                        self.editor.save_state()
+                self.key_move_start_pos = None
+        super().keyReleaseEvent(event)
     
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self.dragging = True
             self.offset = event.pos()
+            self.drag_start_pos = self.pos()  # Sauvegarder position de départ
+            
+            # Sélectionner l'élément dans l'éditeur
+            if self.editor and self.element_data:
+                self.editor.select_element(self.element_data, event)
+            
+            # Sauvegarder l'état AVANT le déplacement
+            if self.editor and hasattr(self.editor, 'save_state_before_drag'):
+                self.editor.save_state_before_drag()
+            
             self.setCursor(Qt.ClosedHandCursor)
+            self.setFocus()  # Prendre le focus au clic
     
     def mouseMoveEvent(self, event):
         if self.dragging:
@@ -114,6 +203,24 @@ class DraggableElement(QLabel):
         if event.button() == Qt.LeftButton:
             self.dragging = False
             self.setCursor(Qt.OpenHandCursor)
+            
+            # Confirmer la modification si la position a changé
+            if hasattr(self, 'drag_start_pos') and self.pos() != self.drag_start_pos:
+                if self.editor and hasattr(self.editor, 'confirm_drag_state'):
+                    self.editor.confirm_drag_state()
+            else:
+                # Annuler l'état pré-enregistré si pas de déplacement
+                if self.editor and hasattr(self.editor, 'cancel_drag_state'):
+                    self.editor.cancel_drag_state()
+    
+    def mouseDoubleClickEvent(self, event):
+        """Ouvrir le dialogue de propriétés au double-clic."""
+        if event.button() == Qt.LeftButton and self.editor and self.element_data:
+            self.editor.select_element(self.element_data, event)
+            self.editor.open_element_properties_dialog(self.element_data)
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
 
 
 class TemplateCanvas(QLabel):
@@ -240,6 +347,7 @@ class TemplateEditorDialog(QDialog):
         
         # Toujours initialiser l'UI d'abord
         self.init_ui()
+        QTimer.singleShot(0, self.showMaximized)
         
         # Charger le template seulement si fourni et APRÈS que l'UI soit prête
         if template_path:
@@ -249,82 +357,114 @@ class TemplateEditorDialog(QDialog):
     
     def init_ui(self):
         """Initialiser l'interface"""
-        layout = QHBoxLayout()
+        # Historique pour annuler/rétablir
+        self.undo_stack = []
+        self.redo_stack = []
+        self.max_history = 50
+        self.is_modified = False  # Suivi des modifications
+        
+        # Layout principal vertical pour inclure le menu
+        main_layout = QVBoxLayout()
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(0)
+        
+        # === Créer le menu ===
+        self.create_menu_bar(main_layout)
+        
+        # Container pour le contenu
+        content_widget = QWidget()
+        content_layout = QHBoxLayout(content_widget)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Appliquer le style moderne
+        self.apply_modern_style()
         
         # === Panneau gauche: Canvas ===
         left_panel = QVBoxLayout()
         
         # Canvas avec scroll
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        self.scroll_area = QScrollArea()
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setStyleSheet("""
+            QScrollArea {
+                border: 2px solid #3498db;
+                border-radius: 8px;
+                background-color: #2c3e50;
+            }
+        """)
         
         self.canvas = TemplateCanvas()
-        scroll.setWidget(self.canvas)
+        self.scroll_area.setWidget(self.canvas)
         
-        left_panel.addWidget(QLabel("<h2>📐 Canvas de Design</h2>"))
+        # Header du canvas
+        canvas_header = QLabel("📐 Canvas de Design")
+        canvas_header.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #ecf0f1;
+                padding: 10px;
+                background-color: #34495e;
+                border-radius: 8px;
+            }
+        """)
+        left_panel.addWidget(canvas_header)
         
-        # Contrôles de zoom
-        zoom_layout = QHBoxLayout()
-        zoom_layout.addWidget(QLabel("Zoom:"))
+        # Barre de statut du zoom
+        self.status_bar = QLabel("Zoom: 100% | Position: - | Élément: Aucun")
+        self.status_bar.setStyleSheet("""
+            QLabel {
+                font-size: 11px;
+                color: #bdc3c7;
+                padding: 5px 10px;
+                background-color: #2c3e50;
+                border-radius: 4px;
+            }
+        """)
+        left_panel.addWidget(self.status_bar)
         
-        btn_zoom_out = QPushButton("➖")
-        btn_zoom_out.setMaximumWidth(40)
-        btn_zoom_out.setToolTip("Zoom arrière")
-        btn_zoom_out.clicked.connect(self.zoom_out)
-        zoom_layout.addWidget(btn_zoom_out)
-        
-        self.zoom_label = QLabel("100%")
-        self.zoom_label.setAlignment(Qt.AlignCenter)
-        self.zoom_label.setMinimumWidth(60)
-        self.zoom_label.setStyleSheet("font-weight: bold; color: #2E86AB;")
-        zoom_layout.addWidget(self.zoom_label)
-        
-        btn_zoom_in = QPushButton("➕")
-        btn_zoom_in.setMaximumWidth(40)
-        btn_zoom_in.setToolTip("Zoom avant")
-        btn_zoom_in.clicked.connect(self.zoom_in)
-        zoom_layout.addWidget(btn_zoom_in)
-        
-        btn_zoom_reset = QPushButton("🔄")
-        btn_zoom_reset.setMaximumWidth(40)
-        btn_zoom_reset.setToolTip("Réinitialiser le zoom")
-        btn_zoom_reset.clicked.connect(self.zoom_reset)
-        zoom_layout.addWidget(btn_zoom_reset)
-        
-        zoom_layout.addStretch()
-        left_panel.addLayout(zoom_layout)
-        
-        left_panel.addWidget(scroll)
-        
-        # Boutons d'action
-        btn_layout = QHBoxLayout()
-        
-        btn_generate = QPushButton("📂 Générer")
-        btn_generate.clicked.connect(self.go_to_generator)
-        btn_generate.setStyleSheet("background-color: #06A77D; color: white; padding: 10px; font-weight: bold;")
-        btn_layout.addWidget(btn_generate)
-        
-        btn_save = QPushButton("💾 Sauvegarder Configuration")
-        btn_save.clicked.connect(self.save_config)
-        btn_layout.addWidget(btn_save)
-        
-        btn_preview = QPushButton("👁 Aperçu")
-        btn_preview.clicked.connect(self.preview_invitation)
-        btn_layout.addWidget(btn_preview)
-        
-        left_panel.addLayout(btn_layout)
+        left_panel.addWidget(self.scroll_area)
         
         # === Panneau droit: Contrôles ===
         right_panel = QVBoxLayout()
-        right_panel.addWidget(QLabel("<h2>🎨 Éléments</h2>"))
+        
+        # Header des éléments
+        elements_header = QLabel("🎨 Éléments")
+        elements_header.setStyleSheet("""
+            QLabel {
+                font-size: 18px;
+                font-weight: bold;
+                color: #ecf0f1;
+                padding: 10px;
+                background-color: #34495e;
+                border-radius: 8px;
+            }
+        """)
+        right_panel.addWidget(elements_header)
         
         # Groupe: Ajouter des éléments
-        add_group = QGroupBox("Ajouter un élément")
+        add_group = QGroupBox("➕ Ajouter un élément")
+        add_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #ecf0f1;
+                border: 2px solid #3498db;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
         add_layout = QVBoxLayout()
         
         # Boutons pour ajouter des éléments
         elements_to_add = [
             ("Nom Complet", "text", "nom_complet"),
+            ("Titre", "text", "titre"),
             ("Prénom", "text", "prenom"),
             ("Nom", "text", "nom"),
             ("Catégorie", "text", "categorie"),
@@ -337,12 +477,86 @@ class TemplateEditorDialog(QDialog):
         
         for label, elem_type, elem_id in elements_to_add:
             btn = QPushButton(f"+ {label}")
+            btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3498db;
+                    color: white;
+                    border: none;
+                    padding: 8px 15px;
+                    border-radius: 5px;
+                    font-weight: bold;
+                }
+                QPushButton:hover {
+                    background-color: #2980b9;
+                }
+            """)
             btn.clicked.connect(lambda checked, l=label, t=elem_type, i=elem_id: 
                               self.add_element(l, t, i))
             add_layout.addWidget(btn)
         
         add_group.setLayout(add_layout)
         right_panel.addWidget(add_group)
+        
+        # Actions rapides: les propriétés sont maintenant dans un dialogue
+        quick_actions_group = QGroupBox("⚙️ Élément sélectionné")
+        quick_actions_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #ecf0f1;
+                border: 2px solid #06A77D;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
+        quick_actions_layout = QVBoxLayout()
+        
+        info_dialog = QLabel("Double-cliquez un élément sur le canvas ou sélectionnez-le puis ouvrez ses propriétés.")
+        info_dialog.setWordWrap(True)
+        info_dialog.setStyleSheet("color: #bdc3c7; font-size: 12px;")
+        quick_actions_layout.addWidget(info_dialog)
+        
+        btn_open_props = QPushButton("Modifier les propriétés")
+        btn_open_props.setStyleSheet("""
+            QPushButton {
+                background-color: #06A77D;
+                color: white;
+                border: none;
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #059669;
+            }
+        """)
+        btn_open_props.clicked.connect(lambda: self.open_element_properties_dialog(self.selected_element))
+        quick_actions_layout.addWidget(btn_open_props)
+        
+        btn_delete_selected = QPushButton("Supprimer l'élément sélectionné")
+        btn_delete_selected.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border: none;
+                padding: 10px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #c0392b;
+            }
+        """)
+        btn_delete_selected.clicked.connect(self.delete_selected_element)
+        quick_actions_layout.addWidget(btn_delete_selected)
+        
+        quick_actions_group.setLayout(quick_actions_layout)
+        right_panel.addWidget(quick_actions_group)
         
         # Groupe: Propriétés de l'élément sélectionné (avec scroll)
         props_group = QGroupBox("Propriétés")
@@ -424,6 +638,36 @@ class TemplateEditorDialog(QDialog):
         self.prop_qr_fill_color.setStyleSheet("background-color: #000000; color: white;")
         props_layout.addRow("Couleur éléments QR:", self.prop_qr_fill_color)
         
+        # Bordure QR Code
+        self.prop_qr_border_width = QSpinBox()
+        self.prop_qr_border_width.setRange(0, 20)
+        self.prop_qr_border_width.setValue(0)
+        self.prop_qr_border_width.setSuffix(" px")
+        self.prop_qr_border_width.valueChanged.connect(self.update_qr_border)
+        props_layout.addRow("Bordure QR:", self.prop_qr_border_width)
+        
+        self.prop_qr_border_color = QPushButton("Couleur bordure")
+        self.prop_qr_border_color.clicked.connect(self.choose_qr_border_color)
+        self.current_qr_border_color = QColor(0, 0, 0)
+        self.prop_qr_border_color.setStyleSheet("background-color: #000000; color: white;")
+        props_layout.addRow("Couleur bordure QR:", self.prop_qr_border_color)
+        
+        # Radius QR Code (coins arrondis)
+        self.prop_qr_radius = QSpinBox()
+        self.prop_qr_radius.setRange(0, 50)
+        self.prop_qr_radius.setValue(0)
+        self.prop_qr_radius.setSuffix(" px")
+        self.prop_qr_radius.valueChanged.connect(self.update_qr_radius)
+        props_layout.addRow("Coins arrondis QR:", self.prop_qr_radius)
+        
+        # Marge interne QR Code (padding)
+        self.prop_qr_padding = QSpinBox()
+        self.prop_qr_padding.setRange(0, 50)
+        self.prop_qr_padding.setValue(4)
+        self.prop_qr_padding.setSuffix(" px")
+        self.prop_qr_padding.valueChanged.connect(self.update_qr_padding)
+        props_layout.addRow("Marge interne QR:", self.prop_qr_padding)
+        
         # Finaliser le scroll des propriétés
         props_widget.setLayout(props_layout)
         props_scroll.setWidget(props_widget)
@@ -431,10 +675,26 @@ class TemplateEditorDialog(QDialog):
         props_group_layout = QVBoxLayout()
         props_group_layout.addWidget(props_scroll)
         props_group.setLayout(props_group_layout)
-        right_panel.addWidget(props_group)
+        self.props_group = props_group
+        self.props_group.hide()
         
         # Liste des éléments
-        list_group = QGroupBox("Éléments ajoutés")
+        list_group = QGroupBox("📋 Éléments ajoutés")
+        list_group.setStyleSheet("""
+            QGroupBox {
+                font-weight: bold;
+                color: #ecf0f1;
+                border: 2px solid #9b59b6;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+        """)
         list_layout = QVBoxLayout()
         
         # Scroll area pour la liste
@@ -450,21 +710,682 @@ class TemplateEditorDialog(QDialog):
         list_layout.addWidget(scroll_list)
         
         btn_clear = QPushButton("🗑 Tout supprimer")
+        btn_clear.setStyleSheet("""
+            QPushButton {
+                background-color: #e74c3c;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #c0392b;
+            }
+        """)
         btn_clear.clicked.connect(self.clear_elements)
         list_layout.addWidget(btn_clear)
         
         list_group.setLayout(list_layout)
-        right_panel.addWidget(list_group)
+        self.list_group = list_group
+        self.list_group.hide()
         
         right_panel.addStretch()
         
         # Assembler les panneaux
-        layout.addLayout(left_panel, 3)
-        layout.addLayout(right_panel, 1)
+        content_layout.addLayout(left_panel, 1)
+        self.hidden_right_panel = right_panel
         
-        self.setLayout(layout)
+        main_layout.addWidget(content_widget)
+        
+        self.setLayout(main_layout)
         
         self.selected_element = None
+        
+        # Créer les raccourcis clavier
+        self.create_shortcuts()
+    
+    def keyPressEvent(self, event):
+        """Gérer les touches directionnelles pour déplacer l'élément sélectionné"""
+        if event.matches(QKeySequence.Undo):
+            self.undo()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Redo) or (event.modifiers() == (Qt.ControlModifier | Qt.ShiftModifier) and event.key() == Qt.Key_Z):
+            self.redo()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Save):
+            self.save_config()
+            event.accept()
+            return
+        
+        if self.selected_element:
+            widget = self.selected_element['widget']
+            step = 10 if event.modifiers() & Qt.ShiftModifier else 1  # Shift = déplacement rapide
+            
+            new_x = widget.x()
+            new_y = widget.y()
+            
+            if event.key() == Qt.Key_Left:
+                new_x = max(0, widget.x() - step)
+            elif event.key() == Qt.Key_Right:
+                parent_rect = widget.parent().rect()
+                new_x = min(widget.x() + step, parent_rect.width() - widget.width())
+            elif event.key() == Qt.Key_Up:
+                new_y = max(0, widget.y() - step)
+            elif event.key() == Qt.Key_Down:
+                parent_rect = widget.parent().rect()
+                new_y = min(widget.y() + step, parent_rect.height() - widget.height())
+            elif event.key() == Qt.Key_Delete:
+                # Supprimer l'élément avec la touche Suppr
+                self.delete_selected_element()
+                return
+            else:
+                super().keyPressEvent(event)
+                return
+            
+            widget.move(new_x, new_y)
+            widget.update_label()
+            
+            # Mettre à jour les spinboxes de position
+            if hasattr(self, 'prop_x') and hasattr(self, 'prop_y'):
+                scale = self.canvas.scale_factor
+                if scale > 0:
+                    self.prop_x.blockSignals(True)
+                    self.prop_y.blockSignals(True)
+                    self.prop_x.setValue(round(new_x / scale))
+                    self.prop_y.setValue(round(new_y / scale))
+                    self.prop_x.blockSignals(False)
+                    self.prop_y.blockSignals(False)
+        else:
+            super().keyPressEvent(event)
+    
+    def delete_selected_element(self):
+        """Supprimer l'élément actuellement sélectionné"""
+        if not self.selected_element:
+            return
+        
+        # Sauvegarder l'état avant modification
+        self.save_state()
+        
+        # Trouver et supprimer de la liste
+        for i, elem in enumerate(self.elements):
+            if elem == self.selected_element:
+                elem['widget'].deleteLater()
+                self.elements.pop(i)
+                break
+        
+        self.selected_element = None
+        self.update_elements_list()
+        self.update_status_bar()
+    
+    def create_menu_bar(self, main_layout):
+        """Créer la barre de menu"""
+        menu_bar = QMenuBar()
+        menu_bar.setStyleSheet("""
+            QMenuBar {
+                background-color: #2c3e50;
+                color: #ecf0f1;
+                padding: 5px;
+                font-size: 13px;
+            }
+            QMenuBar::item {
+                background-color: transparent;
+                padding: 8px 15px;
+                border-radius: 4px;
+            }
+            QMenuBar::item:selected {
+                background-color: #3498db;
+            }
+            QMenu {
+                background-color: #34495e;
+                color: #ecf0f1;
+                border: 1px solid #3498db;
+                padding: 5px;
+            }
+            QMenu::item {
+                padding: 8px 30px;
+                border-radius: 4px;
+            }
+            QMenu::item:selected {
+                background-color: #3498db;
+            }
+            QMenu::separator {
+                height: 1px;
+                background-color: #7f8c8d;
+                margin: 5px 10px;
+            }
+        """)
+        
+        # === Menu Fichier ===
+        file_menu = menu_bar.addMenu("📁 Fichier")
+        
+        action_save = QAction("💾 Enregistrer", self)
+        action_save.triggered.connect(self.save_config)
+        file_menu.addAction(action_save)
+        
+        action_save_as = QAction("💾 Enregistrer sous...", self)
+        action_save_as.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        action_save_as.setShortcutContext(Qt.WindowShortcut)
+        action_save_as.triggered.connect(self.save_config_as)
+        file_menu.addAction(action_save_as)
+        
+        file_menu.addSeparator()
+        
+        action_load = QAction("📂 Charger template...", self)
+        action_load.setShortcut(QKeySequence.Open)
+        action_load.setShortcutContext(Qt.WindowShortcut)
+        action_load.triggered.connect(self.load_template_dialog)
+        file_menu.addAction(action_load)
+        
+        file_menu.addSeparator()
+        
+        action_close = QAction("❌ Fermer", self)
+        action_close.setShortcut(QKeySequence("Alt+F4"))
+        action_close.triggered.connect(self.close)
+        file_menu.addAction(action_close)
+        
+        # === Menu Édition ===
+        edit_menu = menu_bar.addMenu("✏️ Édition")
+        
+        self.action_undo = QAction("↩️ Annuler", self)
+        self.action_undo.triggered.connect(self.undo)
+        self.action_undo.setEnabled(False)
+        edit_menu.addAction(self.action_undo)
+        
+        self.action_redo = QAction("↪️ Rétablir", self)
+        self.action_redo.triggered.connect(self.redo)
+        self.action_redo.setEnabled(False)
+        edit_menu.addAction(self.action_redo)
+        
+        edit_menu.addSeparator()
+        
+        action_delete = QAction("🗑️ Supprimer élément", self)
+        action_delete.triggered.connect(self.delete_selected_element)
+        edit_menu.addAction(action_delete)
+        
+        action_clear = QAction("🗑️ Tout supprimer", self)
+        action_clear.triggered.connect(self.clear_elements)
+        edit_menu.addAction(action_clear)
+        
+        # === Menu Éléments ===
+        elements_menu = menu_bar.addMenu("📋 Éléments")
+        
+        add_element_menu = elements_menu.addMenu("➕ Ajouter un élément")
+        elements_to_add = [
+            ("Nom Complet", "text", "nom_complet"),
+            ("Titre", "text", "titre"),
+            ("Prénom", "text", "prenom"),
+            ("Nom", "text", "nom"),
+            ("Catégorie", "text", "categorie"),
+            ("Nom Événement", "text", "event_nom"),
+            ("Date", "text", "event_date"),
+            ("Heure", "text", "event_heure"),
+            ("Lieu", "text", "event_lieu"),
+            ("QR Code", "qr", "qrcode"),
+        ]
+        for label, elem_type, elem_id in elements_to_add:
+            action_add = QAction(label, self)
+            action_add.triggered.connect(lambda checked, l=label, t=elem_type, i=elem_id: self.add_element(l, t, i))
+            add_element_menu.addAction(action_add)
+        
+        elements_menu.addSeparator()
+        
+        action_all_elements = QAction("Afficher tous les éléments...", self)
+        action_all_elements.triggered.connect(self.open_elements_dialog)
+        elements_menu.addAction(action_all_elements)
+        
+        elements_menu.addSeparator()
+        
+        action_selected_properties = QAction("Propriétés de l'élément sélectionné", self)
+        action_selected_properties.triggered.connect(lambda: self.open_element_properties_dialog(self.selected_element))
+        elements_menu.addAction(action_selected_properties)
+        
+        action_delete_selected = QAction("Supprimer l'élément sélectionné", self)
+        action_delete_selected.triggered.connect(self.delete_selected_element)
+        elements_menu.addAction(action_delete_selected)
+        
+        # === Menu Affichage ===
+        view_menu = menu_bar.addMenu("👁️ Affichage")
+        
+        action_preview = QAction("👁️ Aperçu", self)
+        action_preview.setShortcut(QKeySequence("Ctrl+P"))
+        action_preview.setShortcutContext(Qt.WindowShortcut)
+        action_preview.triggered.connect(self.preview_invitation)
+        view_menu.addAction(action_preview)
+        
+        view_menu.addSeparator()
+        
+        action_zoom_in = QAction("🔍+ Zoom avant", self)
+        action_zoom_in.setShortcut(QKeySequence.ZoomIn)
+        action_zoom_in.setShortcutContext(Qt.WindowShortcut)
+        action_zoom_in.triggered.connect(self.zoom_in)
+        view_menu.addAction(action_zoom_in)
+        
+        action_zoom_out = QAction("🔍- Zoom arrière", self)
+        action_zoom_out.setShortcut(QKeySequence.ZoomOut)
+        action_zoom_out.setShortcutContext(Qt.WindowShortcut)
+        action_zoom_out.triggered.connect(self.zoom_out)
+        view_menu.addAction(action_zoom_out)
+        
+        action_zoom_reset = QAction("🔄 Réinitialiser zoom", self)
+        action_zoom_reset.setShortcut(QKeySequence("Ctrl+0"))
+        action_zoom_reset.setShortcutContext(Qt.WindowShortcut)
+        action_zoom_reset.triggered.connect(self.zoom_reset)
+        view_menu.addAction(action_zoom_reset)
+        
+        # === Menu Outils ===
+        tools_menu = menu_bar.addMenu("🔧 Outils")
+        
+        action_generate = QAction("🎨 Génération", self)
+        action_generate.setShortcut(QKeySequence("Ctrl+G"))
+        action_generate.setShortcutContext(Qt.WindowShortcut)
+        action_generate.triggered.connect(self.go_to_generator)
+        tools_menu.addAction(action_generate)
+        
+        tools_menu.addSeparator()
+        
+        # Sous-menu Zoom
+        zoom_submenu = tools_menu.addMenu("🔍 Zoom")
+        
+        action_zoom_50 = QAction("50%", self)
+        action_zoom_50.triggered.connect(lambda: self.set_zoom(0.5))
+        zoom_submenu.addAction(action_zoom_50)
+        
+        action_zoom_75 = QAction("75%", self)
+        action_zoom_75.triggered.connect(lambda: self.set_zoom(0.75))
+        zoom_submenu.addAction(action_zoom_75)
+        
+        action_zoom_100 = QAction("100%", self)
+        action_zoom_100.triggered.connect(lambda: self.set_zoom(1.0))
+        zoom_submenu.addAction(action_zoom_100)
+        
+        action_zoom_150 = QAction("150%", self)
+        action_zoom_150.triggered.connect(lambda: self.set_zoom(1.5))
+        zoom_submenu.addAction(action_zoom_150)
+        
+        action_zoom_200 = QAction("200%", self)
+        action_zoom_200.triggered.connect(lambda: self.set_zoom(2.0))
+        zoom_submenu.addAction(action_zoom_200)
+        
+        # === Menu Aide ===
+        help_menu = menu_bar.addMenu("❓ Aide")
+        
+        action_shortcuts = QAction("⌨️ Raccourcis clavier", self)
+        action_shortcuts.setShortcut(QKeySequence("F1"))
+        action_shortcuts.setShortcutContext(Qt.WindowShortcut)
+        action_shortcuts.triggered.connect(self.show_shortcuts_help)
+        help_menu.addAction(action_shortcuts)
+        
+        action_about = QAction("ℹ️ À propos", self)
+        action_about.triggered.connect(self.show_about)
+        help_menu.addAction(action_about)
+        
+        main_layout.setMenuBar(menu_bar)
+    
+    def create_shortcuts(self):
+        """Créer les raccourcis clavier supplémentaires"""
+        # Raccourcis explicites pour undo/redo (plus fiables dans QDialog)
+        # IMPORTANT: Stocker comme attributs pour éviter la destruction par le garbage collector
+        self.shortcut_undo = QShortcut(QKeySequence("Ctrl+Z"), self)
+        self.shortcut_undo.setContext(Qt.WindowShortcut)
+        self.shortcut_undo.activated.connect(self.undo)
+        self.shortcut_undo.activatedAmbiguously.connect(self.undo)
+        
+        self.shortcut_redo = QShortcut(QKeySequence("Ctrl+Y"), self)
+        self.shortcut_redo.setContext(Qt.WindowShortcut)
+        self.shortcut_redo.activated.connect(self.redo)
+        self.shortcut_redo.activatedAmbiguously.connect(self.redo)
+        
+        self.shortcut_redo2 = QShortcut(QKeySequence("Ctrl+Shift+Z"), self)
+        self.shortcut_redo2.setContext(Qt.WindowShortcut)
+        self.shortcut_redo2.activated.connect(self.redo)
+        self.shortcut_redo2.activatedAmbiguously.connect(self.redo)
+        
+        self.shortcut_save = QShortcut(QKeySequence("Ctrl+S"), self)
+        self.shortcut_save.setContext(Qt.WindowShortcut)
+        self.shortcut_save.activated.connect(self.save_config)
+        self.shortcut_save.activatedAmbiguously.connect(self.save_config)
+        
+        self.shortcut_delete = QShortcut(QKeySequence("Delete"), self)
+        self.shortcut_delete.setContext(Qt.WindowShortcut)
+        self.shortcut_delete.activated.connect(self.delete_selected_element)
+        self.shortcut_delete.activatedAmbiguously.connect(self.delete_selected_element)
+        
+        print("✅ Raccourcis clavier initialisés: Ctrl+Z, Ctrl+Y, Ctrl+S, Delete")
+    
+    def apply_modern_style(self):
+        """Appliquer le style moderne à l'application"""
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #1a252f;
+            }
+            QLabel {
+                color: #ecf0f1;
+            }
+            QSpinBox, QComboBox, QLineEdit {
+                background-color: #34495e;
+                color: #ecf0f1;
+                border: 1px solid #3498db;
+                border-radius: 4px;
+                padding: 5px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #34495e;
+                color: #ecf0f1;
+                selection-background-color: #3498db;
+                selection-color: white;
+                border: 1px solid #3498db;
+            }
+            QSpinBox:focus, QComboBox:focus, QLineEdit:focus {
+                border: 2px solid #3498db;
+            }
+            QPushButton {
+                background-color: #3498db;
+                color: white;
+                border: none;
+                padding: 8px 15px;
+                border-radius: 5px;
+            }
+            QPushButton:hover {
+                background-color: #2980b9;
+            }
+            QGroupBox {
+                font-weight: bold;
+                color: #ecf0f1;
+                border: 2px solid #3498db;
+                border-radius: 8px;
+                margin-top: 10px;
+                padding-top: 10px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+            }
+            QScrollArea {
+                border: none;
+                background-color: transparent;
+            }
+        """)
+    
+    def save_state_before_drag(self):
+        """Pré-enregistrer l'état avant un glisser-déposer"""
+        self.pending_drag_state = self._capture_current_state()
+        print(f"📌 État pré-enregistré avant drag")
+    
+    def confirm_drag_state(self):
+        """Confirmer l'état pré-enregistré après un déplacement effectif"""
+        if hasattr(self, 'pending_drag_state') and self.pending_drag_state is not None:
+            self.undo_stack.append(self.pending_drag_state)
+            if len(self.undo_stack) > self.max_history:
+                self.undo_stack.pop(0)
+            self.redo_stack.clear()
+            self.pending_drag_state = None
+            self.set_modified(True)
+            self.update_undo_redo_actions()
+            print(f"✅ Drag confirmé - Undo stack: {len(self.undo_stack)}")
+    
+    def cancel_drag_state(self):
+        """Annuler l'état pré-enregistré si pas de déplacement"""
+        self.pending_drag_state = None
+    
+    def _capture_current_state(self):
+        """Capturer l'état actuel de tous les éléments"""
+        state = []
+        for elem in self.elements:
+            elem_copy = {
+                'id': elem['id'],
+                'label': elem['label'],
+                'type': elem['type'],
+                'x': elem['widget'].x(),
+                'y': elem['widget'].y(),
+                'width': elem['widget'].width(),
+                'height': elem['widget'].height(),
+                'font_name': elem.get('font_name', ''),
+                'font_size': elem.get('font_size', 40),
+                'color': elem.get('color', '#000000'),
+                'text_bold': elem.get('text_bold', False),
+                'text_italic': elem.get('text_italic', False),
+                'text_underline': elem.get('text_underline', False),
+                'text_align': elem.get('text_align', 'left'),
+            }
+            if elem['type'] == 'qr':
+                elem_copy['qr_bg_color'] = elem.get('qr_bg_color', '#FFFFFF')
+                elem_copy['qr_fill_color'] = elem.get('qr_fill_color', '#000000')
+                elem_copy['qr_border_width'] = elem.get('qr_border_width', 0)
+                elem_copy['qr_border_color'] = elem.get('qr_border_color', '#000000')
+                elem_copy['qr_radius'] = elem.get('qr_radius', 0)
+                elem_copy['qr_padding'] = elem.get('qr_padding', 4)
+            state.append(elem_copy)
+        return state
+    
+    def save_state(self):
+        """Sauvegarder l'état actuel pour annuler/rétablir"""
+        state = self._capture_current_state()
+        
+        self.undo_stack.append(state)
+        print(f"💾 État sauvegardé - Stack: {len(self.undo_stack)} états")
+        if len(self.undo_stack) > self.max_history:
+            self.undo_stack.pop(0)
+        
+        self.redo_stack.clear()
+        self.update_undo_redo_actions()
+        
+        # Marquer comme modifié
+        self.set_modified(True)
+    
+    def undo(self):
+        """Annuler la dernière action"""
+        print(f"🔄 Undo demandé - Stack: {len(self.undo_stack)} états")
+        if not self.undo_stack:
+            print("⚠️ Aucun état à annuler")
+            return
+        
+        # Sauvegarder l'état actuel dans redo
+        current_state = self._capture_current_state()
+        self.redo_stack.append(current_state)
+        
+        # Restaurer l'état précédent
+        previous_state = self.undo_stack.pop()
+        self.restore_state(previous_state)
+        self.update_undo_redo_actions()
+        print(f"✅ Undo effectué - Undo: {len(self.undo_stack)}, Redo: {len(self.redo_stack)}")
+    
+    def redo(self):
+        """Rétablir la dernière action annulée"""
+        print(f"🔄 Redo demandé - Stack: {len(self.redo_stack)} états")
+        if not self.redo_stack:
+            print("⚠️ Aucun état à rétablir")
+            return
+        
+        # Sauvegarder l'état actuel dans undo
+        current_state = self._capture_current_state()
+        self.undo_stack.append(current_state)
+        
+        # Restaurer l'état suivant
+        next_state = self.redo_stack.pop()
+        self.restore_state(next_state)
+        self.update_undo_redo_actions()
+        print(f"✅ Redo effectué - Undo: {len(self.undo_stack)}, Redo: {len(self.redo_stack)}")
+    
+    def restore_state(self, state):
+        """Restaurer un état sauvegardé"""
+        print(f"🔄 Restauration de {len(state)} éléments...")
+        
+        # Supprimer tous les éléments actuels
+        for elem in self.elements:
+            elem['widget'].deleteLater()
+        self.elements.clear()
+        self.selected_element = None
+        
+        # Recréer les éléments
+        for elem_data in state:
+            element = DraggableElement(elem_data['type'], elem_data['label'], self.canvas, editor=self)
+            element.move(elem_data['x'], elem_data['y'])
+            element.resize(elem_data['width'], elem_data['height'])
+            element.show()
+            
+            new_elem = {
+                'widget': element,
+                'id': elem_data['id'],
+                'label': elem_data['label'],
+                'type': elem_data['type'],
+                'font_name': elem_data.get('font_name', ''),
+                'font_size': elem_data.get('font_size', 40),
+                'color': elem_data.get('color', '#000000'),
+                'text_bold': elem_data.get('text_bold', False),
+                'text_italic': elem_data.get('text_italic', False),
+                'text_underline': elem_data.get('text_underline', False),
+                'text_align': elem_data.get('text_align', 'left'),
+            }
+            
+            if elem_data['type'] == 'qr':
+                new_elem['qr_bg_color'] = elem_data.get('qr_bg_color', '#FFFFFF')
+                new_elem['qr_fill_color'] = elem_data.get('qr_fill_color', '#000000')
+                new_elem['qr_border_width'] = elem_data.get('qr_border_width', 0)
+                new_elem['qr_border_color'] = elem_data.get('qr_border_color', '#000000')
+                new_elem['qr_radius'] = elem_data.get('qr_radius', 0)
+                new_elem['qr_padding'] = elem_data.get('qr_padding', 4)
+            
+            # Lier les données à l'élément widget pour la sélection automatique
+            element.element_data = new_elem
+            
+            self.elements.append(new_elem)
+            print(f"  ✓ Restauré: {elem_data['label']} à ({elem_data['x']}, {elem_data['y']})")
+        
+        self.update_elements_list()
+        self.update_status_bar()
+        print(f"✅ Restauration terminée - {len(self.elements)} éléments")
+    
+    def update_undo_redo_actions(self):
+        """Mettre à jour l'état des actions annuler/rétablir"""
+        can_undo = len(self.undo_stack) > 0
+        can_redo = len(self.redo_stack) > 0
+        
+        self.action_undo.setEnabled(can_undo)
+        self.action_redo.setEnabled(can_redo)
+        
+        # Mettre à jour le texte avec le nombre d'actions disponibles
+        if can_undo:
+            self.action_undo.setText(f"↩️ Annuler ({len(self.undo_stack)})")
+        else:
+            self.action_undo.setText("↩️ Annuler")
+        
+        if can_redo:
+            self.action_redo.setText(f"↪️ Rétablir ({len(self.redo_stack)})")
+        else:
+            self.action_redo.setText("↪️ Rétablir")
+    
+    def set_zoom(self, level):
+        """Définir un niveau de zoom spécifique"""
+        self.zoom_level = level
+        self.apply_zoom()
+    
+    def save_config_as(self):
+        """Enregistrer sous un nouveau nom"""
+        file_path, _ = QFileDialog.getSaveFileName(
+            self, "Enregistrer la configuration sous", 
+            str(TEMPLATES_DIR), "JSON (*.json)"
+        )
+        if file_path:
+            self.config_path = Path(file_path)
+            self.save_config()
+    
+    def load_template_dialog(self):
+        """Ouvrir un dialogue pour charger un template"""
+        file_path, _ = SimpleFileSelector.get_open_filename(
+            self, "Choisir un template", str(TEMPLATES_DIR), "Images"
+        )
+        if file_path:
+            self.load_template(file_path)
+    
+    def show_shortcuts_help(self):
+        """Afficher l'aide des raccourcis clavier"""
+        help_text = """
+        <h2>⌨️ Raccourcis clavier</h2>
+        <table style='font-size: 12px;'>
+        <tr><td><b>Ctrl+S</b></td><td>Enregistrer</td></tr>
+        <tr><td><b>Ctrl+Shift+S</b></td><td>Enregistrer sous</td></tr>
+        <tr><td><b>Ctrl+O</b></td><td>Ouvrir un template</td></tr>
+        <tr><td><b>Ctrl+Z</b></td><td>Annuler</td></tr>
+        <tr><td><b>Ctrl+Y</b></td><td>Rétablir</td></tr>
+        <tr><td><b>Ctrl+P</b></td><td>Aperçu</td></tr>
+        <tr><td><b>Ctrl+G</b></td><td>Génération</td></tr>
+        <tr><td><b>Ctrl++</b></td><td>Zoom avant</td></tr>
+        <tr><td><b>Ctrl+-</b></td><td>Zoom arrière</td></tr>
+        <tr><td><b>Ctrl+0</b></td><td>Réinitialiser zoom</td></tr>
+        <tr><td><b>Suppr</b></td><td>Supprimer élément</td></tr>
+        <tr><td><b>Flèches</b></td><td>Déplacer élément (1px)</td></tr>
+        <tr><td><b>Shift+Flèches</b></td><td>Déplacer élément (10px)</td></tr>
+        </table>
+        """
+        QMessageBox.information(self, "Raccourcis clavier", help_text)
+    
+    def show_about(self):
+        """Afficher la fenêtre À propos"""
+        about_text = """
+        <h2>📐 Éditeur de Template</h2>
+        <p><b>Version 1.0</b></p>
+        <p>Éditeur visuel pour positionner les éléments sur les templates d'invitation.</p>
+        <hr>
+        <p><b>Fonctionnalités:</b></p>
+        <ul>
+        <li>Positionnement par glisser-déposer</li>
+        <li>Déplacement précis au clavier</li>
+        <li>Personnalisation des polices et couleurs</li>
+        <li>Configuration QR Code avancée</li>
+        <li>Annuler / Rétablir illimité</li>
+        </ul>
+        """
+        QMessageBox.about(self, "À propos", about_text)
+    
+    def set_modified(self, modified=True):
+        """Marquer le document comme modifié"""
+        self.is_modified = modified
+        # Mettre à jour le titre avec un indicateur
+        title = "Éditeur de Template"
+        if modified:
+            title = "* " + title
+        self.setWindowTitle(title)
+    
+    def closeEvent(self, event):
+        """Demander confirmation avant de fermer si des modifications non sauvegardées"""
+        if self.is_modified:
+            reply = QMessageBox.question(
+                self, "Modifications non sauvegardées",
+                "Vous avez des modifications non enregistrées.\n\nVoulez-vous les sauvegarder avant de quitter ?",
+                QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel,
+                QMessageBox.Save
+            )
+            
+            if reply == QMessageBox.Save:
+                self.save_config()
+                event.accept()
+            elif reply == QMessageBox.Discard:
+                event.accept()
+            else:  # Cancel
+                event.ignore()
+        else:
+            event.accept()
+    
+    def update_status_bar(self):
+        """Mettre à jour la barre de statut"""
+        zoom_text = f"Zoom: {int(self.zoom_level * 100)}%"
+        
+        if self.selected_element:
+            widget = self.selected_element['widget']
+            scale = self.canvas.scale_factor if self.canvas.scale_factor > 0 else 1
+            real_x = round(widget.x() / scale)
+            real_y = round(widget.y() / scale)
+            pos_text = f"Position: ({real_x}, {real_y})"
+            elem_text = f"Élément: {self.selected_element['label']}"
+        else:
+            pos_text = "Position: -"
+            elem_text = "Élément: Aucun"
+        
+        self.status_bar.setText(f"{zoom_text} | {pos_text} | {elem_text}")
     
     def zoom_in(self):
         """Zoom avant (+25%)"""
@@ -483,7 +1404,8 @@ class TemplateEditorDialog(QDialog):
     
     def apply_zoom(self):
         """Appliquer le niveau de zoom au canvas"""
-        self.zoom_label.setText(f"{int(self.zoom_level * 100)}%")
+        # Mettre à jour la barre de statut
+        self.update_status_bar()
         
         if self.canvas.original_width > 0:
             # Calculer le nouveau scale_factor basé sur le zoom
@@ -597,8 +1519,11 @@ class TemplateEditorDialog(QDialog):
     
     def add_element(self, label, element_type, element_id):
         """Ajouter un élément sur le canvas"""
+        # Sauvegarder l'état avant modification
+        self.save_state()
+        
         # Créer l'élément déplaçable
-        element = DraggableElement(element_type, label, self.canvas)
+        element = DraggableElement(element_type, label, self.canvas, editor=self)
         
         # Position initiale (centre du canvas)
         canvas_center_x = (self.canvas.width() - element.width()) // 2
@@ -622,20 +1547,30 @@ class TemplateEditorDialog(QDialog):
             'font_size': 40,
             'font_name': '',
             'color': '#000000',
+            'text_bold': False,
+            'text_italic': False,
+            'text_underline': False,
+            'text_align': 'left',
             'qr_bg_color': '#FFFFFF',
-            'qr_fill_color': '#000000'
+            'qr_fill_color': '#000000',
+            'qr_border_width': 0,
+            'qr_border_color': '#000000',
+            'qr_radius': 0,
+            'qr_padding': 4
         }
+        
+        # Lier les données à l'élément widget pour la sélection automatique
+        element.element_data = element_data
         
         self.elements.append(element_data)
         self.update_elements_list()
-        
-        # Permettre la sélection
-        element.mousePressEvent = lambda e, elem=element_data: self.select_element(elem, e)
+        self.select_element(element_data)
+        self.open_element_properties_dialog(element_data)
     
     def select_element(self, element_data, event=None):
         """Sélectionner un élément"""
         # Désélectionner l'élément précédent
-        if self.selected_element:
+        if self.selected_element and self.selected_element != element_data:
             self.selected_element['widget'].set_selected(False)
         
         self.selected_element = element_data
@@ -643,9 +1578,8 @@ class TemplateEditorDialog(QDialog):
         # Mettre en évidence visuellement
         element_data['widget'].set_selected(True)
         
-        # Appeler le handler de drag original si c'est un clic
-        if event:
-            DraggableElement.mousePressEvent(element_data['widget'], event)
+        # Note: Ne PAS rappeler mousePressEvent ici - éviter la récursion
+        # Le drag est géré directement dans DraggableElement.mousePressEvent
         
         # Mettre à jour les propriétés (conversion écran -> réel)
         widget = element_data['widget']
@@ -693,6 +1627,24 @@ class TemplateEditorDialog(QDialog):
         text_color_fill = 'white' if QColor(qr_fill_color_str).lightness() < 128 else 'black'
         self.prop_qr_fill_color.setStyleSheet(f"background-color: {qr_fill_color_str}; color: {text_color_fill};")
         
+        # Mettre à jour les propriétés QR supplémentaires
+        self.prop_qr_border_width.blockSignals(True)
+        self.prop_qr_border_width.setValue(element_data.get('qr_border_width', 0))
+        self.prop_qr_border_width.blockSignals(False)
+        
+        qr_border_color_str = element_data.get('qr_border_color', '#000000')
+        self.current_qr_border_color = QColor(qr_border_color_str)
+        text_color_border = 'white' if QColor(qr_border_color_str).lightness() < 128 else 'black'
+        self.prop_qr_border_color.setStyleSheet(f"background-color: {qr_border_color_str}; color: {text_color_border};")
+        
+        self.prop_qr_radius.blockSignals(True)
+        self.prop_qr_radius.setValue(element_data.get('qr_radius', 0))
+        self.prop_qr_radius.blockSignals(False)
+        
+        self.prop_qr_padding.blockSignals(True)
+        self.prop_qr_padding.setValue(element_data.get('qr_padding', 4))
+        self.prop_qr_padding.blockSignals(False)
+        
         # Réactiver les signaux
         self.prop_x.blockSignals(False)
         self.prop_y.blockSignals(False)
@@ -708,7 +1660,344 @@ class TemplateEditorDialog(QDialog):
             pass
         self.prop_font_name.currentIndexChanged.connect(self.update_element_font)
         
+        # Mettre à jour la barre de statut
+        self.update_status_bar()
+        
         print(f"✓ Élément sélectionné: {element_data['label']}")
+    
+    def open_element_properties_dialog(self, element_data):
+        """Ouvrir les propriétés d'un élément dans un dialogue dédié."""
+        if not element_data:
+            QMessageBox.information(self, "Aucun élément", "Sélectionnez d'abord un élément sur le canvas.")
+            return
+        
+        self.select_element(element_data)
+        widget = element_data['widget']
+        scale = self.canvas.scale_factor if self.canvas.scale_factor > 0 else 1
+        
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Propriétés - {element_data['label']}")
+        dialog.setMinimumWidth(460)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1a252f;
+            }
+            QLabel {
+                color: #ecf0f1;
+            }
+            QSpinBox, QComboBox {
+                background-color: #34495e;
+                color: #ecf0f1;
+                border: 1px solid #3498db;
+                border-radius: 4px;
+                padding: 6px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #34495e;
+                color: #ecf0f1;
+                selection-background-color: #3498db;
+                selection-color: white;
+                border: 1px solid #3498db;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        layout.setSpacing(12)
+        
+        title = QLabel(f"<h2>{element_data['label']}</h2>")
+        title.setStyleSheet("color: #ecf0f1;")
+        layout.addWidget(title)
+        
+        form = QFormLayout()
+        
+        spin_x = QSpinBox()
+        spin_x.setRange(0, 10000)
+        spin_x.setValue(round(widget.x() / scale))
+        form.addRow("Position X (px réels):", spin_x)
+        
+        spin_y = QSpinBox()
+        spin_y.setRange(0, 10000)
+        spin_y.setValue(round(widget.y() / scale))
+        form.addRow("Position Y (px réels):", spin_y)
+        
+        spin_width = QSpinBox()
+        spin_width.setRange(20, 10000)
+        spin_width.setValue(round(widget.width() / scale))
+        form.addRow("Largeur (px réels):", spin_width)
+        
+        spin_height = QSpinBox()
+        spin_height.setRange(20, 10000)
+        spin_height.setValue(round(widget.height() / scale))
+        form.addRow("Hauteur (px réels):", spin_height)
+        
+        spin_font_size = None
+        font_combo = None
+        text_color_button = None
+        check_bold = None
+        check_italic = None
+        check_underline = None
+        align_combo = None
+        text_color = QColor(element_data.get('color', '#000000'))
+        
+        def style_color_button(button, color):
+            text_color_name = 'black' if color.lightness() > 128 else 'white'
+            button.setStyleSheet(f"background-color: {color.name()}; color: {text_color_name}; padding: 8px;")
+        
+        def choose_color(current_color, label):
+            selected = QColorDialog.getColor(current_color, dialog, label)
+            return selected if selected.isValid() else current_color
+        
+        if element_data['type'] == 'text':
+            spin_font_size = QSpinBox()
+            spin_font_size.setRange(10, 200)
+            spin_font_size.setValue(element_data.get('font_size', 40))
+            form.addRow("Taille police:", spin_font_size)
+            
+            font_combo = QComboBox()
+            for i in range(self.prop_font_name.count()):
+                font_combo.addItem(self.prop_font_name.itemText(i), self.prop_font_name.itemData(i))
+            font_index = font_combo.findData(element_data.get('font_name', ''))
+            if font_index >= 0:
+                font_combo.setCurrentIndex(font_index)
+            form.addRow("Police:", font_combo)
+            
+            text_color_button = QPushButton("Choisir couleur")
+            style_color_button(text_color_button, text_color)
+            
+            def update_text_color():
+                nonlocal text_color
+                text_color = choose_color(text_color, "Couleur du texte")
+                style_color_button(text_color_button, text_color)
+            
+            text_color_button.clicked.connect(update_text_color)
+            form.addRow("Couleur texte:", text_color_button)
+            
+            check_bold = QCheckBox("Gras")
+            check_bold.setChecked(element_data.get('text_bold', False))
+            check_bold.setStyleSheet("color: #ecf0f1;")
+            form.addRow("Style:", check_bold)
+            
+            check_italic = QCheckBox("Italique")
+            check_italic.setChecked(element_data.get('text_italic', False))
+            check_italic.setStyleSheet("color: #ecf0f1;")
+            form.addRow("", check_italic)
+            
+            check_underline = QCheckBox("Souligné")
+            check_underline.setChecked(element_data.get('text_underline', False))
+            check_underline.setStyleSheet("color: #ecf0f1;")
+            form.addRow("", check_underline)
+            
+            align_combo = QComboBox()
+            align_combo.addItem("Gauche", "left")
+            align_combo.addItem("Centré", "center")
+            align_combo.addItem("Droite", "right")
+            align_index = align_combo.findData(element_data.get('text_align', 'left'))
+            if align_index >= 0:
+                align_combo.setCurrentIndex(align_index)
+            form.addRow("Alignement:", align_combo)
+        
+        qr_bg_color = QColor(element_data.get('qr_bg_color', '#FFFFFF'))
+        qr_fill_color = QColor(element_data.get('qr_fill_color', '#000000'))
+        qr_border_color = QColor(element_data.get('qr_border_color', '#000000'))
+        spin_qr_border = None
+        spin_qr_radius = None
+        spin_qr_padding = None
+        
+        if element_data['type'] == 'qr':
+            qr_bg_button = QPushButton("Fond QR")
+            style_color_button(qr_bg_button, qr_bg_color)
+            
+            def update_qr_bg_color():
+                nonlocal qr_bg_color
+                qr_bg_color = choose_color(qr_bg_color, "Couleur fond QR")
+                style_color_button(qr_bg_button, qr_bg_color)
+            
+            qr_bg_button.clicked.connect(update_qr_bg_color)
+            form.addRow("Couleur fond QR:", qr_bg_button)
+            
+            qr_fill_button = QPushButton("Éléments QR")
+            style_color_button(qr_fill_button, qr_fill_color)
+            
+            def update_qr_fill_color():
+                nonlocal qr_fill_color
+                qr_fill_color = choose_color(qr_fill_color, "Couleur éléments QR")
+                style_color_button(qr_fill_button, qr_fill_color)
+            
+            qr_fill_button.clicked.connect(update_qr_fill_color)
+            form.addRow("Couleur éléments QR:", qr_fill_button)
+            
+            spin_qr_border = QSpinBox()
+            spin_qr_border.setRange(0, 50)
+            spin_qr_border.setSuffix(" px")
+            spin_qr_border.setValue(element_data.get('qr_border_width', 0))
+            form.addRow("Bordure QR:", spin_qr_border)
+            
+            qr_border_button = QPushButton("Couleur bordure")
+            style_color_button(qr_border_button, qr_border_color)
+            
+            def update_qr_border_color():
+                nonlocal qr_border_color
+                qr_border_color = choose_color(qr_border_color, "Couleur bordure QR")
+                style_color_button(qr_border_button, qr_border_color)
+            
+            qr_border_button.clicked.connect(update_qr_border_color)
+            form.addRow("Couleur bordure QR:", qr_border_button)
+            
+            spin_qr_radius = QSpinBox()
+            spin_qr_radius.setRange(0, 100)
+            spin_qr_radius.setSuffix(" px")
+            spin_qr_radius.setValue(element_data.get('qr_radius', 0))
+            form.addRow("Coins arrondis QR:", spin_qr_radius)
+            
+            spin_qr_padding = QSpinBox()
+            spin_qr_padding.setRange(0, 100)
+            spin_qr_padding.setSuffix(" px")
+            spin_qr_padding.setValue(element_data.get('qr_padding', 4))
+            form.addRow("Marge interne QR:", spin_qr_padding)
+        
+        layout.addLayout(form)
+        
+        buttons_layout = QHBoxLayout()
+        btn_delete = QPushButton("Supprimer")
+        btn_delete.setStyleSheet("background-color: #e74c3c; color: white; padding: 10px 18px; font-weight: bold;")
+        
+        def delete_from_dialog():
+            self.selected_element = element_data
+            self.delete_selected_element()
+            dialog.accept()
+        
+        btn_delete.clicked.connect(delete_from_dialog)
+        buttons_layout.addWidget(btn_delete)
+        
+        btn_cancel = QPushButton("Annuler")
+        btn_cancel.clicked.connect(dialog.reject)
+        buttons_layout.addWidget(btn_cancel)
+        
+        btn_save = QPushButton("Enregistrer")
+        btn_save.setStyleSheet("background-color: #06A77D; color: white; padding: 10px 18px; font-weight: bold;")
+        
+        def apply_properties():
+            self.save_state()
+            element_data['widget'].move(round(spin_x.value() * scale), round(spin_y.value() * scale))
+            element_data['widget'].resize(
+                max(20, round(spin_width.value() * scale)),
+                max(20, round(spin_height.value() * scale))
+            )
+            element_data['widget'].update_label()
+            
+            if element_data['type'] == 'text':
+                element_data['font_size'] = spin_font_size.value()
+                element_data['font_name'] = font_combo.currentData() or ''
+                element_data['color'] = text_color.name()
+                element_data['text_bold'] = check_bold.isChecked()
+                element_data['text_italic'] = check_italic.isChecked()
+                element_data['text_underline'] = check_underline.isChecked()
+                element_data['text_align'] = align_combo.currentData()
+            
+            if element_data['type'] == 'qr':
+                element_data['qr_bg_color'] = qr_bg_color.name()
+                element_data['qr_fill_color'] = qr_fill_color.name()
+                element_data['qr_border_width'] = spin_qr_border.value()
+                element_data['qr_border_color'] = qr_border_color.name()
+                element_data['qr_radius'] = spin_qr_radius.value()
+                element_data['qr_padding'] = spin_qr_padding.value()
+            
+            self.select_element(element_data)
+            self.update_elements_list()
+            self.update_status_bar()
+            self.set_modified(True)
+            dialog.accept()
+        
+        btn_save.clicked.connect(apply_properties)
+        buttons_layout.addWidget(btn_save)
+        layout.addLayout(buttons_layout)
+        
+        dialog.exec_()
+    
+    def open_elements_dialog(self):
+        """Afficher tous les éléments du template dans un dialogue."""
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Tous les éléments")
+        dialog.setMinimumSize(650, 500)
+        dialog.setStyleSheet("""
+            QDialog {
+                background-color: #1a252f;
+            }
+            QLabel {
+                color: #ecf0f1;
+            }
+            QPushButton {
+                padding: 8px 12px;
+                border-radius: 5px;
+            }
+        """)
+        
+        layout = QVBoxLayout(dialog)
+        title = QLabel("<h2>Éléments du template</h2>")
+        title.setStyleSheet("color: #ecf0f1;")
+        layout.addWidget(title)
+        
+        if not self.elements:
+            empty_label = QLabel("Aucun élément ajouté.")
+            empty_label.setStyleSheet("color: #bdc3c7; font-style: italic;")
+            layout.addWidget(empty_label)
+        else:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            content = QWidget()
+            elements_layout = QVBoxLayout(content)
+            
+            for elem in self.elements:
+                row = QWidget()
+                row.setStyleSheet("""
+                    QWidget {
+                        background-color: #2c3e50;
+                        border-radius: 6px;
+                    }
+                """)
+                row_layout = QHBoxLayout(row)
+                
+                widget = elem['widget']
+                scale = self.canvas.scale_factor if self.canvas.scale_factor > 0 else 1
+                info = QLabel(
+                    f"<b>{elem['label']}</b> ({elem['type']})<br>"
+                    f"ID: {elem['id']} | Position: {round(widget.x() / scale)}, {round(widget.y() / scale)}"
+                )
+                info.setStyleSheet("color: #ecf0f1; padding: 6px;")
+                row_layout.addWidget(info, 1)
+                
+                btn_select = QPushButton("Sélectionner")
+                btn_select.setStyleSheet("background-color: #3498db; color: white;")
+                btn_select.clicked.connect(lambda checked, e=elem: self.select_element(e))
+                row_layout.addWidget(btn_select)
+                
+                btn_props = QPushButton("Propriétés")
+                btn_props.setStyleSheet("background-color: #06A77D; color: white;")
+                btn_props.clicked.connect(lambda checked, e=elem: self.open_element_properties_dialog(e))
+                row_layout.addWidget(btn_props)
+                
+                btn_delete = QPushButton("Supprimer")
+                btn_delete.setStyleSheet("background-color: #e74c3c; color: white;")
+                
+                def delete_elem(checked=False, e=elem):
+                    self.select_element(e)
+                    self.delete_selected_element()
+                    dialog.accept()
+                
+                btn_delete.clicked.connect(delete_elem)
+                row_layout.addWidget(btn_delete)
+                
+                elements_layout.addWidget(row)
+            
+            elements_layout.addStretch()
+            scroll.setWidget(content)
+            layout.addWidget(scroll)
+        
+        btn_close = QPushButton("Fermer")
+        btn_close.clicked.connect(dialog.close)
+        layout.addWidget(btn_close)
+        
+        dialog.exec_()
     
     def update_element_font(self):
         """Mettre à jour la police de l'élément sélectionné"""
@@ -772,6 +2061,7 @@ class TemplateEditorDialog(QDialog):
         """Choisir une couleur pour l'élément"""
         color = QColorDialog.getColor(self.current_color, self)
         if color.isValid() and self.selected_element:
+            self.save_state()
             self.current_color = color
             self.selected_element['color'] = color.name()
             self.prop_color.setStyleSheet(f"background-color: {color.name()}; color: white;")
@@ -781,6 +2071,7 @@ class TemplateEditorDialog(QDialog):
         """Choisir la couleur de fond du QR code"""
         color = QColorDialog.getColor(self.current_qr_bg_color, self)
         if color.isValid() and self.selected_element:
+            self.save_state()
             self.current_qr_bg_color = color
             self.selected_element['qr_bg_color'] = color.name()
             text_color = 'black' if color.lightness() > 128 else 'white'
@@ -791,11 +2082,41 @@ class TemplateEditorDialog(QDialog):
         """Choisir la couleur des éléments du QR code"""
         color = QColorDialog.getColor(self.current_qr_fill_color, self)
         if color.isValid() and self.selected_element:
+            self.save_state()
             self.current_qr_fill_color = color
             self.selected_element['qr_fill_color'] = color.name()
             text_color = 'white' if color.lightness() < 128 else 'black'
             self.prop_qr_fill_color.setStyleSheet(f"background-color: {color.name()}; color: {text_color};")
             print(f"✓ Couleur éléments QR: {color.name()}")
+    
+    def choose_qr_border_color(self):
+        """Choisir la couleur de la bordure du QR code"""
+        color = QColorDialog.getColor(self.current_qr_border_color, self)
+        if color.isValid() and self.selected_element:
+            self.save_state()
+            self.current_qr_border_color = color
+            self.selected_element['qr_border_color'] = color.name()
+            text_color = 'white' if color.lightness() < 128 else 'black'
+            self.prop_qr_border_color.setStyleSheet(f"background-color: {color.name()}; color: {text_color};")
+            print(f"✓ Couleur bordure QR: {color.name()}")
+    
+    def update_qr_border(self):
+        """Mettre à jour l'épaisseur de bordure du QR code"""
+        if self.selected_element:
+            self.selected_element['qr_border_width'] = self.prop_qr_border_width.value()
+            print(f"✓ Bordure QR: {self.prop_qr_border_width.value()}px")
+    
+    def update_qr_radius(self):
+        """Mettre à jour le radius des coins du QR code"""
+        if self.selected_element:
+            self.selected_element['qr_radius'] = self.prop_qr_radius.value()
+            print(f"✓ Radius QR: {self.prop_qr_radius.value()}px")
+    
+    def update_qr_padding(self):
+        """Mettre à jour la marge interne du QR code"""
+        if self.selected_element:
+            self.selected_element['qr_padding'] = self.prop_qr_padding.value()
+            print(f"✓ Marge interne QR: {self.prop_qr_padding.value()}px")
     
     def load_available_fonts(self):
         """Charger la liste des polices disponibles"""
@@ -893,10 +2214,13 @@ class TemplateEditorDialog(QDialog):
     
     def clear_elements(self):
         """Supprimer tous les éléments"""
+        if self.elements:  # Ne sauvegarder que s'il y a des éléments
+            self.save_state()
         for elem in self.elements:
             elem['widget'].deleteLater()
         self.elements.clear()
         self.update_elements_list()
+        self.update_status_bar()
     
     def save_config(self):
         """Sauvegarder la configuration des positions"""
@@ -944,13 +2268,24 @@ class TemplateEditorDialog(QDialog):
                 'font_size': elem.get('font_size', 40),
                 'font_name': elem.get('font_name', ''),
                 'color': elem.get('color', '#000000'),
+                'text_bold': elem.get('text_bold', False),
+                'text_italic': elem.get('text_italic', False),
+                'text_underline': elem.get('text_underline', False),
+                'text_align': elem.get('text_align', 'left'),
                 'qr_bg_color': elem.get('qr_bg_color', '#FFFFFF'),
-                'qr_fill_color': elem.get('qr_fill_color', '#000000')
+                'qr_fill_color': elem.get('qr_fill_color', '#000000'),
+                'qr_border_width': elem.get('qr_border_width', 0),
+                'qr_border_color': elem.get('qr_border_color', '#000000'),
+                'qr_radius': elem.get('qr_radius', 0),
+                'qr_padding': elem.get('qr_padding', 4)
             })
         
         # Sauvegarder dans un fichier JSON avec précision maximale
         with open(self.config_path, 'w', encoding='utf-8') as f:
             json.dump(config, f, indent=2, ensure_ascii=False, sort_keys=False)
+        
+        # Marquer comme non modifié après sauvegarde
+        self.set_modified(False)
         
         print(f"\n💾 Configuration sauvegardée: {self.config_path}")
         print(f"   Template: {self.canvas.original_width}x{self.canvas.original_height}")
@@ -959,9 +2294,15 @@ class TemplateEditorDialog(QDialog):
         for elem in config['elements']:
             print(f"     - {elem['label']}: ({elem['x']}, {elem['y']}) {elem['width']}x{elem['height']}")
         
+        self.afficher_message_enregistrement(len(config['elements']))
         QMessageBox.information(self, "Succès", 
-                              f"Configuration sauvegardée !\n{self.config_path}\n\n"
+                              f"Enregistrement effectué !\n{self.config_path}\n\n"
                               f"{len(config['elements'])} élément(s) enregistré(s)")
+    
+    def afficher_message_enregistrement(self, nombre_elements):
+        """Afficher un message temporaire après sauvegarde."""
+        self.status_bar.setText(f"✅ Enregistrement effectué - {nombre_elements} élément(s) sauvegardé(s)")
+        QTimer.singleShot(3000, self.update_status_bar)
     
     def delayed_load_config(self):
         """Charger la config après stabilisation du canvas"""
@@ -1006,7 +2347,8 @@ class TemplateEditorDialog(QDialog):
                 element = DraggableElement(
                     elem_config['type'], 
                     elem_config['label'], 
-                    self.canvas
+                    self.canvas,
+                    editor=self
                 )
                 
                 # Les positions sont déjà en pixels réels dans le JSON
@@ -1041,12 +2383,22 @@ class TemplateEditorDialog(QDialog):
                     'font_size': elem_config.get('font_size', 40),
                     'font_name': elem_config.get('font_name', ''),
                     'color': elem_config.get('color', '#000000'),
+                    'text_bold': elem_config.get('text_bold', False),
+                    'text_italic': elem_config.get('text_italic', False),
+                    'text_underline': elem_config.get('text_underline', False),
+                    'text_align': elem_config.get('text_align', 'left'),
                     'qr_bg_color': elem_config.get('qr_bg_color', '#FFFFFF'),
-                    'qr_fill_color': elem_config.get('qr_fill_color', '#000000')
+                    'qr_fill_color': elem_config.get('qr_fill_color', '#000000'),
+                    'qr_border_width': elem_config.get('qr_border_width', 0),
+                    'qr_border_color': elem_config.get('qr_border_color', '#000000'),
+                    'qr_radius': elem_config.get('qr_radius', 0),
+                    'qr_padding': elem_config.get('qr_padding', 4)
                 }
                 
+                # Lier les données à l'élément widget pour la sélection automatique
+                element.element_data = element_data
+                
                 self.elements.append(element_data)
-                element.mousePressEvent = lambda e, elem=element_data: self.select_element(elem, e)
             
             self.update_elements_list()
             print(f"✅ {len(self.elements)} élément(s) chargé(s)")
@@ -1087,6 +2439,7 @@ class TemplateEditorDialog(QDialog):
                 'id': 999,
                 'nom': 'DUPONT',
                 'prenom': 'Jean',
+                'titre': 'Mr.',
                 'categorie': 'VIP',
                 'evenement': {
                     'nom': 'APERÇU TEST',
@@ -1171,8 +2524,16 @@ class TemplateEditorDialog(QDialog):
                 'font_size': elem.get('font_size', 40),
                 'font_name': elem.get('font_name', ''),
                 'color': elem.get('color', '#000000'),
+                'text_bold': elem.get('text_bold', False),
+                'text_italic': elem.get('text_italic', False),
+                'text_underline': elem.get('text_underline', False),
+                'text_align': elem.get('text_align', 'left'),
                 'qr_bg_color': elem.get('qr_bg_color', '#FFFFFF'),
-                'qr_fill_color': elem.get('qr_fill_color', '#000000')
+                'qr_fill_color': elem.get('qr_fill_color', '#000000'),
+                'qr_border_width': elem.get('qr_border_width', 0),
+                'qr_border_color': elem.get('qr_border_color', '#000000'),
+                'qr_radius': elem.get('qr_radius', 0),
+                'qr_padding': elem.get('qr_padding', 4)
             })
         
         return config

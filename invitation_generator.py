@@ -6,6 +6,7 @@ import qrcode
 import uuid
 import json
 import os
+import re
 from pathlib import Path
 from config import INVITATIONS_DIR, QRCODES_DIR, QR_CONFIG, INVITATION_CONFIG, FONTS_DIR, DEFAULT_FONTS
 
@@ -148,6 +149,74 @@ class InvitationGenerator:
         qr_path = QRCODES_DIR / f"qr_{invite_id}.png"
         qr_img.save(qr_path)
         return str(qr_path)
+
+    @staticmethod
+    def nettoyer_nom_dossier(nom):
+        """Nettoyer un nom pour en faire un dossier valide."""
+        nom = (nom or "evenement").strip()
+        nom = "".join(c if c.isalnum() or c in (" ", "-", "_", ".") else "_" for c in nom)
+        nom = re.sub(r"[\s_]+", "_", nom).strip("._")
+        return nom or "evenement"
+
+    def dossier_evenement(self, invite_data):
+        """Creer/retourner le dossier de l'evenement pour les invitations."""
+        event_nom = ""
+        if invite_data and invite_data.get("evenement"):
+            event_nom = invite_data["evenement"].get("nom", "")
+        dossier = INVITATIONS_DIR / self.nettoyer_nom_dossier(event_nom)
+        dossier.mkdir(parents=True, exist_ok=True)
+        return dossier
+
+    def dessiner_texte_style(self, invitation, text, zone, font, color, bold=False,
+                             italic=False, underline=False, align='left'):
+        """Dessiner un texte avec style dans une zone de template."""
+        x, y, width, height = zone
+        temp = Image.new('RGBA', (10, 10), (0, 0, 0, 0))
+        temp_draw = ImageDraw.Draw(temp)
+        bbox = temp_draw.textbbox((0, 0), text, font=font)
+        text_width = max(1, bbox[2] - bbox[0])
+        text_height = max(1, bbox[3] - bbox[1])
+        padding = max(8, int(text_height * 0.25))
+        
+        layer_width = text_width + padding * 2 + (text_height if italic else 0)
+        layer_height = text_height + padding * 2 + (4 if underline else 0)
+        layer = Image.new('RGBA', (layer_width, layer_height), (0, 0, 0, 0))
+        layer_draw = ImageDraw.Draw(layer)
+        
+        draw_x = padding
+        draw_y = padding - bbox[1]
+        offsets = [(0, 0), (1, 0), (0, 1), (1, 1)] if bold else [(0, 0)]
+        for ox, oy in offsets:
+            layer_draw.text((draw_x + ox, draw_y + oy), text, fill=color, font=font)
+        
+        if underline:
+            underline_y = padding + text_height + 2
+            line_width = max(1, font.size // 18) if hasattr(font, 'size') else 2
+            layer_draw.line(
+                (draw_x, underline_y, draw_x + text_width, underline_y),
+                fill=color,
+                width=line_width
+            )
+        
+        if italic:
+            skew = 0.22
+            skew_extra = int(layer_height * skew)
+            layer = layer.transform(
+                (layer_width + skew_extra, layer_height),
+                Image.AFFINE,
+                (1, -skew, skew_extra, 0, 1, 0),
+                resample=Image.BICUBIC
+            )
+        
+        if align == 'center':
+            paste_x = x + (width - layer.width) // 2
+        elif align == 'right':
+            paste_x = x + width - layer.width
+        else:
+            paste_x = x
+        
+        paste_y = y + height - layer.height
+        invitation.paste(layer, (max(0, paste_x), max(0, paste_y)), layer)
     
     def creer_invitation(self, invite_data, save_path=None):
         """
@@ -196,9 +265,15 @@ class InvitationGenerator:
         
         # Sauvegarder l'invitation
         if save_path is None:
-            # Créer le nom composé : Invitation-NomComplet
-            nom_complet = f"{invite_data['prenom']}_{invite_data['nom']}".replace(" ", "_")
-            save_path = INVITATIONS_DIR / f"Invitation-{nom_complet}.jpg"
+            # Créer le nom composé : Invitation-Titre_Nom
+            titre = invite_data.get('titre', '').strip()
+            nom_complet = f"{titre} {invite_data['nom']}".strip()
+            nom_fichier = "".join(
+                c if c.isalnum() or c in (" ", "-", "_", ".") else "_"
+                for c in nom_complet
+            ).replace(" ", "_")
+            event_dir = self.dossier_evenement(invite_data)
+            save_path = event_dir / f"Invitation-{nom_fichier}.jpg"
         
         invitation.save(save_path, quality=INVITATION_CONFIG['quality'], dpi=(INVITATION_CONFIG['dpi'], INVITATION_CONFIG['dpi']))
         
@@ -206,9 +281,15 @@ class InvitationGenerator:
     
     def appliquer_config(self, invitation, draw, invite_data, qr_img, qr_data):
         """Appliquer la configuration personnalisée"""
+        titre = invite_data.get('titre', '').strip()
+        nom_complet = f"{invite_data['prenom']} {invite_data['nom']}".strip()
+        if titre:
+            nom_complet = f"{titre} {nom_complet}".strip()
+        
         # Mapper les IDs aux données
         data_map = {
-            'nom_complet': f"{invite_data['prenom']} {invite_data['nom']}",
+            'nom_complet': nom_complet,
+            'titre': titre,
             'prenom': invite_data['prenom'],
             'nom': invite_data['nom'],
             'categorie': invite_data['categorie'],
@@ -228,18 +309,76 @@ class InvitationGenerator:
                 # Récupérer les couleurs personnalisées
                 qr_fill_color = elem.get('qr_fill_color', '#000000')
                 qr_bg_color = elem.get('qr_bg_color', '#FFFFFF')
+                qr_border_width = elem.get('qr_border_width', 0)
+                qr_border_color = elem.get('qr_border_color', '#000000')
+                qr_radius = elem.get('qr_radius', 0)
+                qr_padding = elem.get('qr_padding', 4)
                 
                 # Régénérer le QR code avec les couleurs personnalisées
                 width = max(50, elem['width'])  # Minimum 50px
                 height = max(50, elem['height'])  # Minimum 50px
-                qr_custom = self.generer_qr_code(qr_data, taille=max(width, height), 
+                
+                # Taille du QR code sans les marges
+                qr_inner_size = max(width, height) - (2 * qr_padding) - (2 * qr_border_width)
+                qr_custom = self.generer_qr_code(qr_data, taille=qr_inner_size, 
                                                  fill_color=qr_fill_color, 
                                                  back_color=qr_bg_color)
-                qr_resized = qr_custom.resize((width, height))
+                
+                # Créer l'image finale avec fond, bordure et radius
+                from PIL import ImageDraw as PilImageDraw
+                
+                # Créer une image avec le fond
+                final_qr = Image.new('RGBA', (width, height), (0, 0, 0, 0))
+                qr_draw = PilImageDraw.Draw(final_qr)
+                
+                # Convertir les couleurs hex en tuples RGB
+                def hex_to_rgb(hex_color):
+                    hex_color = hex_color.lstrip('#')
+                    return tuple(int(hex_color[i:i+2], 16) for i in (0, 2, 4))
+                
+                bg_rgb = hex_to_rgb(qr_bg_color)
+                border_rgb = hex_to_rgb(qr_border_color)
+                
+                # Dessiner le fond avec coins arrondis
+                if qr_radius > 0:
+                    qr_draw.rounded_rectangle(
+                        [(0, 0), (width - 1, height - 1)],
+                        radius=qr_radius,
+                        fill=bg_rgb,
+                        outline=border_rgb if qr_border_width > 0 else None,
+                        width=qr_border_width
+                    )
+                else:
+                    qr_draw.rectangle(
+                        [(0, 0), (width - 1, height - 1)],
+                        fill=bg_rgb,
+                        outline=border_rgb if qr_border_width > 0 else None,
+                        width=qr_border_width
+                    )
+                
+                # Redimensionner le QR code pour tenir dans la zone avec padding
+                qr_target_size = width - (2 * qr_padding) - (2 * qr_border_width)
+                qr_resized = qr_custom.resize((qr_target_size, qr_target_size))
+                
+                # Position du QR code dans l'image finale (centré)
+                qr_offset = qr_padding + qr_border_width
+                
+                # Coller le QR code sur le fond
+                if qr_resized.mode == 'RGBA':
+                    final_qr.paste(qr_resized, (qr_offset, qr_offset), qr_resized)
+                else:
+                    final_qr.paste(qr_resized, (qr_offset, qr_offset))
+                
                 x = max(0, elem['x'])
                 y = max(0, elem['y'])
-                invitation.paste(qr_resized, (x, y))
-                print(f"✅ QR Code collé à ({x}, {y}) taille {width}x{height} (fond:{qr_bg_color}, éléments:{qr_fill_color})")
+                
+                # Coller sur l'invitation
+                if final_qr.mode == 'RGBA':
+                    invitation.paste(final_qr, (x, y), final_qr)
+                else:
+                    invitation.paste(final_qr, (x, y))
+                    
+                print(f"✅ QR Code collé à ({x}, {y}) taille {width}x{height} (bordure:{qr_border_width}px, radius:{qr_radius}px, padding:{qr_padding}px)")
             
             elif elem_type == 'text' and elem_id in data_map:
                 # Dessiner le texte
@@ -255,14 +394,18 @@ class InvitationGenerator:
                 x = max(0, elem['x'])
                 y = max(0, elem['y'])
                 
-                # Position du texte : coin inférieur gauche de la zone
-                # y + height correspond au bas de la zone
-                text_x = x
-                text_y = y + elem['height']
-                
-                # Utiliser anchor='lb' (left-bottom) pour positionner depuis le coin inférieur gauche
-                draw.text((text_x, text_y), text, fill=color, font=font, anchor='lb')
-                print(f"✅ Texte '{elem_id}' dessiné à ({text_x}, {text_y}) [coin inférieur gauche]")
+                self.dessiner_texte_style(
+                    invitation,
+                    text,
+                    (x, y, elem['width'], elem['height']),
+                    font,
+                    color,
+                    bold=elem.get('text_bold', False),
+                    italic=elem.get('text_italic', False),
+                    underline=elem.get('text_underline', False),
+                    align=elem.get('text_align', 'left')
+                )
+                print(f"✅ Texte '{elem_id}' dessiné dans la zone ({x}, {y}, {elem['width']}, {elem['height']})")
     
     def appliquer_mode_defaut(self, invitation, draw, invite_data, qr_img, qr_data):
         """Appliquer le mode par défaut (ancien comportement)"""
@@ -287,7 +430,10 @@ class InvitationGenerator:
         draw.text((width//2, 200), event_nom, fill=(46, 134, 171), font=font_titre, anchor="mm")
         
         # Nom de l'invité (centré)
-        nom_complet = f"{invite_data['prenom']} {invite_data['nom']}"
+        titre = invite_data.get('titre', '').strip()
+        nom_complet = f"{invite_data['prenom']} {invite_data['nom']}".strip()
+        if titre:
+            nom_complet = f"{titre} {nom_complet}".strip()
         draw.text((width//2, 500), nom_complet, fill=(0, 0, 0), font=font_nom, anchor="mm")
         
         # Catégorie

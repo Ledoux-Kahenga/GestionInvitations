@@ -1,0 +1,26 @@
+{
+  "template_path": "C:\\Projets\\GestionInvitations\\templates\\Billet complexe scolaire Bakole.png",
+  "template_width": 1659,
+  "template_height": 591,
+  "scale_factor": 1.0,
+  "elements": [
+    {
+      "id": "qrcode",
+      "label": "QR Code",
+      "type": "qr",
+      "x": 1268,
+      "y": 212,
+      "width": 248,
+      "height": 248,
+      "font_size": 40,
+      "font_name": "",
+      "color": "#000000",
+      "qr_bg_color": "#FFFFFF",
+      "qr_fill_color": "#000000",
+      "qr_border_width": 20,
+      "qr_border_color": "#000000",
+      "qr_radius": 20,
+      "qr_padding": 22
+    }
+  ]
+}

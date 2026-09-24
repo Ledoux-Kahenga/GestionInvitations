@@ -43,6 +43,19 @@ class InvitationModel:
             )
         ''')
         
+        # Table des tables (placement)
+        self.cursor.execute('''
+            CREATE TABLE IF NOT EXISTS tables_event (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                evenement_id INTEGER NOT NULL,
+                nom TEXT NOT NULL,
+                capacite INTEGER DEFAULT 10,
+                description TEXT,
+                created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (evenement_id) REFERENCES evenements(id)
+            )
+        ''')
+        
         # Table des invités
         self.cursor.execute('''
             CREATE TABLE IF NOT EXISTS invites (
@@ -50,19 +63,39 @@ class InvitationModel:
                 evenement_id INTEGER NOT NULL,
                 nom TEXT NOT NULL,
                 prenom TEXT NOT NULL,
+                titre TEXT DEFAULT '',
                 email TEXT,
                 telephone TEXT,
+                categorie TEXT DEFAULT 'Standard',
                 nombre_accompagnants INTEGER DEFAULT 0,
-                categorie TEXT,
+                table_id INTEGER,
                 qr_code TEXT UNIQUE,
                 invitation_path TEXT,
-                statut TEXT DEFAULT 'en_attente',
+                statut TEXT DEFAULT 'invité',
                 date_envoi TEXT,
                 date_scan TEXT,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (evenement_id) REFERENCES evenements(id)
+                FOREIGN KEY (evenement_id) REFERENCES evenements(id),
+                FOREIGN KEY (table_id) REFERENCES tables_event(id)
             )
         ''')
+        
+        # Migration: ajouter table_id si elle n'existe pas
+        try:
+            self.cursor.execute("ALTER TABLE invites ADD COLUMN table_id INTEGER")
+        except:
+            pass  # La colonne existe déjà
+
+        # Migrations: ajouter les champs utilises par l'interface moderne
+        try:
+            self.cursor.execute("ALTER TABLE invites ADD COLUMN titre TEXT DEFAULT ''")
+        except:
+            pass  # La colonne existe déjà
+        
+        try:
+            self.cursor.execute("ALTER TABLE invites ADD COLUMN categorie TEXT DEFAULT 'Standard'")
+        except:
+            pass  # La colonne existe déjà
         
         # Table des scans (historique)
         self.cursor.execute('''
@@ -134,23 +167,142 @@ class InvitationModel:
         self.connect()
         # Supprimer d'abord les invités associés
         self.cursor.execute("DELETE FROM invites WHERE evenement_id = ?", (evenement_id,))
+        # Supprimer les tables associées
+        self.cursor.execute("DELETE FROM tables_event WHERE evenement_id = ?", (evenement_id,))
         # Puis supprimer l'événement
         self.cursor.execute("DELETE FROM evenements WHERE id = ?", (evenement_id,))
         self.conn.commit()
         self.disconnect()
         return True
     
+    # === TABLES (PLACEMENT) ===
+    
+    def ajouter_table(self, evenement_id, nom, capacite=10, description=""):
+        """Ajouter une table à un événement"""
+        self.connect()
+        self.cursor.execute('''
+            INSERT INTO tables_event (evenement_id, nom, capacite, description)
+            VALUES (?, ?, ?, ?)
+        ''', (evenement_id, nom, capacite, description))
+        table_id = self.cursor.lastrowid
+        self.conn.commit()
+        self.disconnect()
+        return table_id
+    
+    def obtenir_tables(self, evenement_id):
+        """Obtenir toutes les tables d'un événement"""
+        self.connect()
+        self.cursor.execute('''
+            SELECT t.id, t.evenement_id, t.nom, t.capacite, t.description, t.created_at,
+                   (SELECT COUNT(*) FROM invites WHERE table_id = t.id) as nb_invites,
+                   (SELECT SUM(nombre_accompagnants + 1) FROM invites WHERE table_id = t.id) as nb_personnes
+            FROM tables_event t
+            WHERE t.evenement_id = ?
+            ORDER BY t.nom
+        ''', (evenement_id,))
+        tables = self.cursor.fetchall()
+        self.disconnect()
+        return tables
+    
+    def obtenir_table(self, table_id):
+        """Obtenir une table par ID"""
+        self.connect()
+        self.cursor.execute('''
+            SELECT id, evenement_id, nom, capacite, description, created_at
+            FROM tables_event
+            WHERE id = ?
+        ''', (table_id,))
+        table = self.cursor.fetchone()
+        self.disconnect()
+        return table
+    
+    def modifier_table(self, table_id, nom, capacite=10, description=""):
+        """Modifier une table"""
+        self.connect()
+        self.cursor.execute('''
+            UPDATE tables_event 
+            SET nom = ?, capacite = ?, description = ?
+            WHERE id = ?
+        ''', (nom, capacite, description, table_id))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
+    def supprimer_table(self, table_id):
+        """Supprimer une table (les invités sont désassignés)"""
+        self.connect()
+        # Désassigner les invités de cette table
+        self.cursor.execute("UPDATE invites SET table_id = NULL WHERE table_id = ?", (table_id,))
+        # Supprimer la table
+        self.cursor.execute("DELETE FROM tables_event WHERE id = ?", (table_id,))
+        self.conn.commit()
+        self.disconnect()
+        return True
+    
+    def obtenir_places_disponibles_table(self, table_id, invite_id_exclu=None):
+        """Obtenir la capacité restante d'une table."""
+        if table_id is None:
+            return None
+        
+        self.connect()
+        self.cursor.execute("SELECT nom, capacite FROM tables_event WHERE id = ?", (table_id,))
+        table = self.cursor.fetchone()
+        
+        if not table:
+            self.disconnect()
+            return None
+        
+        query = "SELECT COALESCE(SUM(nombre_accompagnants + 1), 0) FROM invites WHERE table_id = ?"
+        params = [table_id]
+        if invite_id_exclu is not None:
+            query += " AND id != ?"
+            params.append(invite_id_exclu)
+        
+        self.cursor.execute(query, params)
+        places_occupees = self.cursor.fetchone()[0] or 0
+        places_disponibles = table['capacite'] - places_occupees
+        self.disconnect()
+        
+        return {
+            'nom': table['nom'],
+            'capacite': table['capacite'],
+            'occupees': places_occupees,
+            'disponibles': max(0, places_disponibles)
+        }
+    
+    def verifier_capacite_table(self, table_id, nombre_personnes, invite_id_exclu=None):
+        """Vérifier qu'une table peut accueillir un nombre de personnes."""
+        if table_id is None:
+            return True, ""
+        
+        places = self.obtenir_places_disponibles_table(table_id, invite_id_exclu)
+        if not places:
+            return False, "Table introuvable"
+        
+        if nombre_personnes > places['disponibles']:
+            return False, (
+                f"La table '{places['nom']}' n'a plus assez de places "
+                f"({places['disponibles']} disponible(s), {nombre_personnes} demandée(s))."
+            )
+        
+        return True, ""
+    
     # === INVITÉS ===
     
     def ajouter_invite(self, evenement_id, nom, prenom, email="", telephone="", 
-                       nombre_accompagnants=0, categorie="Standard", qr_code=None):
+                       nombre_accompagnants=0, table_id=None, qr_code=None,
+                       titre="", categorie="Standard"):
         """Ajouter un invité"""
+        capacite_ok, message = self.verifier_capacite_table(table_id, nombre_accompagnants + 1)
+        if not capacite_ok:
+            raise ValueError(message)
+        
         self.connect()
         self.cursor.execute('''
-            INSERT INTO invites (evenement_id, nom, prenom, email, telephone, 
-                               nombre_accompagnants, categorie, qr_code)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (evenement_id, nom, prenom, email, telephone, nombre_accompagnants, categorie, qr_code))
+            INSERT INTO invites (evenement_id, nom, prenom, titre, email, telephone, 
+                               categorie, nombre_accompagnants, table_id, qr_code)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ''', (evenement_id, nom, prenom, titre, email, telephone, categorie, nombre_accompagnants, table_id, qr_code))
         invite_id = self.cursor.lastrowid
         self.conn.commit()
         self.disconnect()
@@ -161,20 +313,22 @@ class InvitationModel:
         self.connect()
         if evenement_id:
             self.cursor.execute('''
-                SELECT id, evenement_id, nom, prenom, email, telephone, 
-                       nombre_accompagnants, categorie, qr_code, invitation_path, 
-                       statut, date_envoi, date_scan, created_at
-                FROM invites
-                WHERE evenement_id = ?
-                ORDER BY nom, prenom
+                SELECT i.id, i.evenement_id, i.nom, i.prenom, i.titre, i.email, i.telephone, 
+                       i.categorie, i.nombre_accompagnants, i.table_id, t.nom as table_nom, 
+                       i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at
+                FROM invites i
+                LEFT JOIN tables_event t ON i.table_id = t.id
+                WHERE i.evenement_id = ?
+                ORDER BY i.nom, i.prenom
             ''', (evenement_id,))
         else:
             self.cursor.execute('''
-                SELECT id, evenement_id, nom, prenom, email, telephone, 
-                       nombre_accompagnants, categorie, qr_code, invitation_path, 
-                       statut, date_envoi, date_scan, created_at
-                FROM invites
-                ORDER BY created_at DESC
+                SELECT i.id, i.evenement_id, i.nom, i.prenom, i.titre, i.email, i.telephone, 
+                       i.categorie, i.nombre_accompagnants, i.table_id, t.nom as table_nom, 
+                       i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at
+                FROM invites i
+                LEFT JOIN tables_event t ON i.table_id = t.id
+                ORDER BY i.created_at DESC
             ''')
         invites = self.cursor.fetchall()
         self.disconnect()
@@ -184,15 +338,35 @@ class InvitationModel:
         """Obtenir un invité par son QR code"""
         self.connect()
         self.cursor.execute('''
-            SELECT id, evenement_id, nom, prenom, email, telephone, 
-                   nombre_accompagnants, categorie, qr_code, invitation_path, 
-                   statut, date_envoi, date_scan, created_at
-            FROM invites
-            WHERE qr_code = ?
+            SELECT i.id, i.evenement_id, i.nom, i.prenom, i.titre, i.email, i.telephone, 
+                   i.categorie, i.nombre_accompagnants, i.table_id, t.nom as table_nom, 
+                   i.qr_code, i.invitation_path, i.statut, i.date_envoi, i.date_scan, i.created_at
+            FROM invites i
+            LEFT JOIN tables_event t ON i.table_id = t.id
+            WHERE i.qr_code = ?
         ''', (qr_code,))
         invite = self.cursor.fetchone()
         self.disconnect()
         return invite
+    
+    def modifier_invite(self, invite_id, nom, prenom, email="", telephone="", 
+                        nombre_accompagnants=0, table_id=None, titre="", categorie="Standard"):
+        """Modifier un invité"""
+        capacite_ok, message = self.verifier_capacite_table(
+            table_id, nombre_accompagnants + 1, invite_id_exclu=invite_id
+        )
+        if not capacite_ok:
+            raise ValueError(message)
+        
+        self.connect()
+        self.cursor.execute('''
+            UPDATE invites 
+            SET nom = ?, prenom = ?, titre = ?, email = ?, telephone = ?, categorie = ?, nombre_accompagnants = ?, table_id = ?
+            WHERE id = ?
+        ''', (nom, prenom, titre, email, telephone, categorie, nombre_accompagnants, table_id, invite_id))
+        self.conn.commit()
+        self.disconnect()
+        return True
     
     def mettre_a_jour_invite(self, invite_id, **kwargs):
         """Mettre à jour les informations d'un invité"""
@@ -294,20 +468,21 @@ class InvitationModel:
         presents, personnes_presentes = self.cursor.fetchone()
         personnes_presentes = personnes_presentes or 0
         
-        # Invités par catégorie
+        # Invités par table
         self.cursor.execute('''
-            SELECT categorie, COUNT(*), SUM(nombre_accompagnants + 1),
-                   SUM(CASE WHEN statut = 'présent' THEN 1 ELSE 0 END)
-            FROM invites
-            WHERE evenement_id = ?
-            GROUP BY categorie
+            SELECT COALESCE(t.nom, 'Non assigné'), COUNT(*), SUM(i.nombre_accompagnants + 1),
+                   SUM(CASE WHEN i.statut = 'présent' THEN 1 ELSE 0 END)
+            FROM invites i
+            LEFT JOIN tables_event t ON i.table_id = t.id
+            WHERE i.evenement_id = ?
+            GROUP BY i.table_id
         ''', (evenement_id,))
-        resultats_categories = self.cursor.fetchall()
+        resultats_tables = self.cursor.fetchall()
         
         # Convertir en dictionnaire
-        par_categorie = {}
-        for row in resultats_categories:
-            par_categorie[row[0]] = {
+        par_table = {}
+        for row in resultats_tables:
+            par_table[row[0]] = {
                 'nombre': row[1],
                 'total_personnes': row[2] or 0,
                 'presents': row[3] or 0
@@ -321,5 +496,5 @@ class InvitationModel:
             'presents': presents or 0,
             'personnes_presentes': personnes_presentes,
             'taux_presence': round((presents / total_invites * 100) if total_invites > 0 else 0, 2),
-            'par_categorie': par_categorie
+            'par_table': par_table
         }
